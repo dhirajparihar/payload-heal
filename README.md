@@ -7,8 +7,9 @@
 [![PyPI version](https://img.shields.io/pypi/v/payload-heal.svg?color=blue)](https://pypi.org/project/payload-heal/)
 [![Python versions](https://img.shields.io/pypi/pyversions/payload-heal.svg)](https://pypi.org/project/payload-heal/)
 [![Pydantic v2](https://img.shields.io/badge/pydantic-v2-e92063.svg)](https://docs.pydantic.dev/)
+[![CI](https://github.com/dhirajparihar/payload-heal/actions/workflows/ci.yml/badge.svg)](https://github.com/dhirajparihar/payload-heal/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-54%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-54%20passed-brightgreen.svg)](https://github.com/dhirajparihar/payload-heal/actions)
 
 *Automatically recovers from renamed keys, camelCase drift, and nested wrapper mutations in 0ms.*
 
