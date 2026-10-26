@@ -20,8 +20,10 @@ from __future__ import annotations
 import contextlib
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 from typing import Any, Iterator
@@ -32,8 +34,35 @@ try:
 except ImportError:
     FileLock = None  # Fallback to OS-specific primitives or threading lock
 
+logger = logging.getLogger("payload_heal.lockfile")
 
 DEFAULT_LOCKFILE_PATH = Path(".payload_heal_lock.json")
+
+
+def _resolve_model_key(models: dict[str, Any], model_name: str) -> str | None:
+    """Resolves a model key in the lockfile models dictionary.
+
+    Supports:
+    - Exact match (`myapp.models.Product` or `Product`)
+    - Qualified key to legacy short name (`myapp.models.Product` -> `Product`)
+    - Short name to qualified key (`Product` -> `myapp.models.Product` if unique)
+    """
+    if model_name in models:
+        return model_name
+
+    # If model_name is qualified, check if legacy short key exists in models
+    if "." in model_name:
+        short = model_name.split(".")[-1]
+        if short in models:
+            return short
+        return None
+
+    # model_name is a short name (unqualified). Look for matching qualified keys
+    matching = [k for k in models if k.split(".")[-1] == model_name]
+    if len(matching) == 1:
+        return matching[0]
+
+    return None
 
 
 class LockFileManager:
@@ -95,7 +124,7 @@ class LockFileManager:
                     os.close(lock_fd)
 
     def _read_raw(self) -> dict[str, Any]:
-        """Reads and parses the lockfile JSON. Returns default structure on missing/corrupt."""
+        """Reads and parses the lockfile JSON. Preserves backup on corruption."""
         if not self.lockfile_path.exists():
             return {"version": "1.0", "models": {}}
 
@@ -105,12 +134,29 @@ class LockFileManager:
                 return {"version": "1.0", "models": {}}
             data = json.loads(content)
             if not isinstance(data, dict):
-                return {"version": "1.0", "models": {}}
+                raise ValueError("Lockfile root must be a JSON object")
             data.setdefault("version", "1.0")
             if not isinstance(data.get("models"), dict):
                 data["models"] = {}
             return data
-        except Exception:
+        except Exception as exc:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            backup_path = self.lockfile_path.with_name(f"{self.lockfile_path.name}.corrupted.{timestamp}.bak")
+            try:
+                shutil.copy2(self.lockfile_path, backup_path)
+                logger.warning(
+                    "Lockfile at '%s' is corrupted or invalid (%s). Preserved backup at '%s'. Returning empty lockfile structure.",
+                    self.lockfile_path,
+                    exc,
+                    backup_path,
+                )
+            except Exception as copy_err:
+                logger.warning(
+                    "Lockfile at '%s' is corrupted or invalid (%s). Failed to create backup: %s",
+                    self.lockfile_path,
+                    exc,
+                    copy_err,
+                )
             return {"version": "1.0", "models": {}}
 
     def _write_raw(self, data: dict[str, Any]) -> None:
@@ -146,7 +192,7 @@ class LockFileManager:
         """Retrieves cached field -> source_path mappings for the specified model.
 
         Parameters:
-            model_name: The name of the Pydantic model class.
+            model_name: The name or qualified identifier of the Pydantic model class.
 
         Returns:
             Dictionary mapping `field_name` to healed `source_path`.
@@ -156,12 +202,12 @@ class LockFileManager:
             with self._acquire_file_lock():
                 data = self._read_raw()
                 models = data.get("models", {})
-                model_data = models.get(model_name, {})
-                if not isinstance(model_data, dict):
+                resolved_key = _resolve_model_key(models, model_name)
+                if not resolved_key or not isinstance(models.get(resolved_key), dict):
                     return {}
 
                 mapping: dict[str, str] = {}
-                for field_name, entry in model_data.items():
+                for field_name, entry in models[resolved_key].items():
                     if isinstance(entry, dict) and "source_path" in entry:
                         mapping[field_name] = str(entry["source_path"])
                 return mapping
@@ -171,9 +217,10 @@ class LockFileManager:
         with self._thread_lock:
             with self._acquire_file_lock():
                 data = self._read_raw()
-                model_data = data.get("models", {}).get(model_name, {})
-                if isinstance(model_data, dict):
-                    entry = model_data.get(field_name)
+                models = data.get("models", {})
+                resolved_key = _resolve_model_key(models, model_name)
+                if resolved_key and isinstance(models.get(resolved_key), dict):
+                    entry = models[resolved_key].get(field_name)
                     if isinstance(entry, dict):
                         return dict(entry)
                 return None
@@ -188,7 +235,7 @@ class LockFileManager:
         """Thread-safe and atomic persistence of a healed field path mapping.
 
         Parameters:
-            model_name: Name of the target Pydantic model.
+            model_name: Name or qualified identifier of the target Pydantic model.
             field_name: Target attribute field on the model.
             source_path: Traversal path in the upstream payload (e.g. `items[0].price`).
             healed_by: Strategy used to heal (`heuristic` or `ai`).
@@ -197,7 +244,9 @@ class LockFileManager:
             with self._acquire_file_lock():
                 data = self._read_raw()
                 models = data.setdefault("models", {})
-                model_dict = models.setdefault(model_name, {})
+                # If an existing key resolves to this model, update that key
+                resolved_key = _resolve_model_key(models, model_name) or model_name
+                model_dict = models.setdefault(resolved_key, {})
 
                 now_iso = datetime.now(timezone.utc).isoformat()
                 model_dict[field_name] = {
@@ -212,7 +261,7 @@ class LockFileManager:
         """Invalidates a previously healed field mapping if the schema drifts again.
 
         Parameters:
-            model_name: Target Pydantic model name.
+            model_name: Target Pydantic model name or identifier.
             field_name: The field to invalidate.
 
         Returns:
@@ -222,10 +271,11 @@ class LockFileManager:
             with self._acquire_file_lock():
                 data = self._read_raw()
                 models = data.get("models", {})
-                if model_name not in models:
+                resolved_key = _resolve_model_key(models, model_name)
+                if not resolved_key or resolved_key not in models:
                     return False
 
-                model_dict = models[model_name]
+                model_dict = models[resolved_key]
                 if not isinstance(model_dict, dict) or field_name not in model_dict:
                     return False
 
@@ -233,7 +283,7 @@ class LockFileManager:
 
                 # Prune empty model entries
                 if not model_dict:
-                    del models[model_name]
+                    del models[resolved_key]
 
                 self._write_raw(data)
                 return True
@@ -244,8 +294,9 @@ class LockFileManager:
             with self._acquire_file_lock():
                 data = self._read_raw()
                 models = data.get("models", {})
-                if model_name in models:
-                    del models[model_name]
+                resolved_key = _resolve_model_key(models, model_name)
+                if resolved_key and resolved_key in models:
+                    del models[resolved_key]
                     self._write_raw(data)
                     return True
                 return False

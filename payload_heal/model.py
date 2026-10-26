@@ -26,6 +26,21 @@ from payload_heal.skeleton import extract_json_skeleton, get_by_dot_path
 logger = logging.getLogger("payload_heal.model")
 
 
+def get_model_identifier(schema: type[BaseModel] | str) -> str:
+    """Returns a unique, stable identifier for a Pydantic model class.
+
+    Combines module and class name (e.g. `myapp.models.Product`)
+    to prevent cross-model cached mapping collisions.
+    """
+    if isinstance(schema, str):
+        return schema
+    mod = getattr(schema, "__module__", "")
+    name = getattr(schema, "__name__", "Model")
+    if mod and mod not in ("__main__", "builtins"):
+        return f"{mod}.{name}"
+    return name
+
+
 def get_field_type_str(field_info: FieldInfo) -> str:
     """Extracts a clean, canonical type annotation string from a Pydantic FieldInfo."""
     ann = field_info.annotation
@@ -45,8 +60,8 @@ def auto_heal_dict(
     """Applies the 3-tier healing pipeline to an incoming dictionary payload.
 
     Tiers:
-    0. Fast Path & Lockfile cache lookup
-    1. Heuristic matcher (casing, promotion, token overlap)
+    0. Fast Path & Lockfile cache lookup (with type verification)
+    1. Heuristic matcher (with type verification)
     2. AI Skeleton Healer (LLM query with strict type-safety verification)
 
     Returns:
@@ -59,17 +74,15 @@ def auto_heal_dict(
         alias = getattr(f, "alias", None)
         return name in data or (bool(alias) and alias in data)
 
-    # Identify fields that are missing in the incoming payload
-    missing_fields = {
-        name: f for name, f in model_fields.items() if not is_present(name, f)
+    # Fast Path (0ms overhead): Only fields that are required for validation trigger healing
+    missing_required = {
+        name: f for name, f in model_fields.items()
+        if not is_present(name, f) and f.is_required()
     }
-
-    # Fast Path (0ms overhead): If all required fields are present, return immediately
-    missing_required = [
-        name for name, f in missing_fields.items() if f.is_required()
-    ]
     if not missing_required:
         return data
+
+    missing_fields = dict(missing_required)
 
     healed_data = dict(data)
     healed_notifications: dict[str, tuple[str, str]] = {}
@@ -84,7 +97,21 @@ def auto_heal_dict(
             source_path = cached_mappings[field_name]
             found, val = get_by_dot_path(data, source_path)
             if found:
-                healed_data[field_name] = val
+                # Critical Safety Check: verify type compatibility for cached values
+                expected_type = get_field_type_str(missing_fields[field_name])
+                actual_type = type(val).__name__ if val is not None else "null"
+                if is_type_compatible(expected_type, actual_type, val):
+                    healed_data[field_name] = val
+                else:
+                    logger.warning(
+                        "Cached path '%s' for field '%s' contains incompatible value %r (expected '%s', got '%s'). Invalidating cache.",
+                        source_path,
+                        field_name,
+                        val,
+                        expected_type,
+                        actual_type,
+                    )
+                    lock_manager.invalidate_field(model_name, field_name)
             else:
                 # Upstream API drifted a second time! Invalidate stale cache
                 logger.info(
@@ -101,7 +128,7 @@ def auto_heal_dict(
     }
 
     # Return if all required fields are now satisfied
-    if not any(f.is_required() for f in remaining_missing.values()) and not remaining_missing:
+    if not remaining_missing:
         return healed_data
 
     skeleton: dict[str, dict[str, Any]] | None = None
@@ -119,14 +146,29 @@ def auto_heal_dict(
         for field_name, source_path in heuristic_matches.items():
             found, val = get_by_dot_path(data, source_path)
             if found:
-                healed_data[field_name] = val
-                lock_manager.save_mapping(
-                    model_name,
-                    field_name,
-                    source_path,
-                    healed_by="heuristic",
+                # Critical Safety Check: verify type compatibility before saving heuristic match
+                expected_type = get_field_type_str(remaining_missing[field_name])
+                actual_type = skeleton.get(source_path, {}).get(
+                    "type",
+                    type(val).__name__ if val is not None else "null",
                 )
-                healed_notifications[field_name] = (source_path, "heuristic")
+                if is_type_compatible(expected_type, actual_type, val):
+                    healed_data[field_name] = val
+                    lock_manager.save_mapping(
+                        model_name,
+                        field_name,
+                        source_path,
+                        healed_by="heuristic",
+                    )
+                    healed_notifications[field_name] = (source_path, "heuristic")
+                else:
+                    logger.warning(
+                        "Heuristic suggested '%s' -> '%s' with value %r, which fails type compatibility with '%s'. Discarding.",
+                        field_name,
+                        source_path,
+                        val,
+                        expected_type,
+                    )
 
         remaining_missing = {
             name: f
@@ -157,7 +199,7 @@ def auto_heal_dict(
                 expected_type = get_field_type_str(remaining_missing[field_name])
                 actual_type = skeleton.get(source_path, {}).get(
                     "type",
-                    type(val).__name__,
+                    type(val).__name__ if val is not None else "null",
                 )
                 if is_type_compatible(expected_type, actual_type, val):
                     healed_data[field_name] = val
@@ -189,19 +231,30 @@ class HealableModel(BaseModel):
 
     heal_config: ClassVar[HealConfig] = HealConfig()
 
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        # Ensure each subclass gets its own clone of heal_config to avoid shared mutable state
+        parent_config = getattr(cls, "heal_config", None)
+        if parent_config is not None:
+            cls.heal_config = parent_config.clone()
+        else:
+            cls.heal_config = HealConfig()
+
     @model_validator(mode="before")
     @classmethod
     def _auto_heal_payload(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
 
-        config = getattr(cls, "heal_config", None) or HealConfig()
+        config = getattr(cls, "heal_config", None)
+        if config is None:
+            config = HealConfig()
         if not config.enabled:
             return data
 
         return auto_heal_dict(
             data=data,
-            model_name=cls.__name__,
+            model_name=get_model_identifier(cls),
             model_fields=cls.model_fields,
             config=config,
         )
@@ -219,7 +272,7 @@ def heal_payload(
     cfg = config or getattr(schema, "heal_config", None) or HealConfig()
     return auto_heal_dict(
         data=data,
-        model_name=schema.__name__,
+        model_name=get_model_identifier(schema),
         model_fields=schema.model_fields,
         config=cfg,
     )

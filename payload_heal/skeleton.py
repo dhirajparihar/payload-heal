@@ -30,7 +30,23 @@ _JWT_RE = re.compile(
 )
 
 _API_KEY_RE = re.compile(
-    r"\b(?:sk|ghp|gho|glpat|xoxb|xoxp|key)-[A-Za-z0-9_-]{16,}\b"
+    r"\b(?:sk|ghp|gho|glpat|xoxb|xoxp|key|token|secret)[-_][A-Za-z0-9_-]{12,}\b"
+)
+
+_AWS_KEY_RE = re.compile(
+    r"\bAKIA[0-9A-Z]{16}\b"
+)
+
+_SSN_RE = re.compile(
+    r"\b\d{3}-\d{2}-\d{4}\b"
+)
+
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----"
+)
+
+_SENSITIVE_KEY_PATTERNS = re.compile(
+    r"(?i)(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|bearer|credentials?|ssn|social[_-]?security|cvv|cvc|token)"
 )
 
 # Standard credit card formats: 16-digit cards with separators or 15-digit Amex
@@ -61,19 +77,25 @@ def is_luhn_valid(card_num: str) -> bool:
 
 
 def mask_pii(text: str) -> str:
-    """Masks emails, bearer/API tokens, and credit card numbers from preview strings.
+    """Masks emails, bearer/API tokens, SSNs, private keys, and credit card numbers from strings.
 
-    Returns sanitized text suitable for telemetry or AI skeleton prompts.
+    Note: Masking is best-effort redaction and does not provide an absolute guarantee of anonymity.
     """
     if not isinstance(text, str):
         text = str(text)
 
+    # Mask private key blocks
+    text = _PRIVATE_KEY_RE.sub("[MASKED_PRIVATE_KEY]", text)
     # Mask bearer tokens and headers
     text = _BEARER_RE.sub("Bearer [MASKED_TOKEN]", text)
     # Mask JWTs
     text = _JWT_RE.sub("[MASKED_TOKEN]", text)
     # Mask API keys
     text = _API_KEY_RE.sub("[MASKED_TOKEN]", text)
+    # Mask AWS Access Keys
+    text = _AWS_KEY_RE.sub("[MASKED_AWS_KEY]", text)
+    # Mask SSNs
+    text = _SSN_RE.sub("[MASKED_SSN]", text)
     # Mask email addresses
     text = _EMAIL_RE.sub("[MASKED_EMAIL]", text)
     # Mask formatted credit cards
@@ -91,26 +113,58 @@ def mask_pii(text: str) -> str:
     return text
 
 
+def sanitize_data_recursively(data: Any, max_depth: int = 5) -> Any:
+    """Recursively sanitizes nested dictionaries, lists, and primitives.
+
+    - Replaces sensitive dictionary keys' values with '[MASKED_SECRET]'
+    - Masks PII patterns (emails, tokens, API keys, SSNs, credit cards) in all strings
+    - Recursively traverses nested structures up to max_depth
+    """
+    if max_depth <= 0:
+        return "[TRUNCATED]"
+
+    if isinstance(data, dict):
+        sanitized: dict[str, Any] = {}
+        for k, v in data.items():
+            k_str = str(k)
+            if _SENSITIVE_KEY_PATTERNS.search(k_str):
+                sanitized[k_str] = "[MASKED_SECRET]"
+            else:
+                sanitized[k_str] = sanitize_data_recursively(v, max_depth - 1)
+        return sanitized
+
+    if isinstance(data, list):
+        return [sanitize_data_recursively(item, max_depth - 1) for item in data]
+
+    if isinstance(data, str):
+        return mask_pii(data)
+
+    if isinstance(data, (int, float, bool)) or data is None:
+        return data
+
+    return mask_pii(str(data))
+
+
 def format_sample_preview(val: Any, max_len: int = 80) -> str:
-    """Formats a value into a safe, PII-masked, truncated string preview."""
-    if val is None:
+    """Formats a value into a safe, PII-masked, recursively sanitized preview string."""
+    sanitized_val = sanitize_data_recursively(val)
+
+    if sanitized_val is None:
         return "null"
-    if isinstance(val, bool):
-        return "true" if val else "false"
-    if isinstance(val, (int, float)):
-        return str(val)
-    if isinstance(val, str):
-        masked = mask_pii(val)
-        if len(masked) > max_len:
-            return f"{masked[:max_len]}..."
-        return masked
-    if isinstance(val, dict):
-        if not val:
+    if isinstance(sanitized_val, bool):
+        return "true" if sanitized_val else "false"
+    if isinstance(sanitized_val, (int, float)):
+        return str(sanitized_val)
+    if isinstance(sanitized_val, str):
+        if len(sanitized_val) > max_len:
+            return f"{sanitized_val[:max_len]}..."
+        return sanitized_val
+    if isinstance(sanitized_val, dict):
+        if not sanitized_val:
             return "{}"
         try:
             preview_dict = {
-                str(k): mask_pii(str(v)) if isinstance(v, str) else v
-                for k, v in list(val.items())[:2]
+                str(k): v for k, v in list(sanitized_val.items())[:2]
             }
             s = json.dumps(preview_dict)
             if len(s) > max_len:
@@ -118,13 +172,13 @@ def format_sample_preview(val: Any, max_len: int = 80) -> str:
             return s
         except Exception:
             return "{...}"
-    if isinstance(val, list):
-        if not val:
+    if isinstance(sanitized_val, list):
+        if not sanitized_val:
             return "[]"
         sample_items: list[str] = []
-        for x in val[:2]:
+        for x in sanitized_val[:2]:
             if isinstance(x, str):
-                sample_items.append(repr(mask_pii(x)))
+                sample_items.append(repr(x))
             elif isinstance(x, bool):
                 sample_items.append("true" if x else "false")
             elif isinstance(x, (int, float)):
@@ -133,14 +187,14 @@ def format_sample_preview(val: Any, max_len: int = 80) -> str:
                 sample_items.append("null")
             else:
                 sample_items.append(format_sample_preview(x, max_len=20))
-        if len(val) > len(sample_items):
+        if len(sanitized_val) > len(sample_items):
             s = f"[{', '.join(sample_items)}, ...]"
         else:
             s = f"[{', '.join(sample_items)}]"
         if len(s) > max_len:
             return f"{s[:max_len]}..."
         return s
-    return str(val)[:max_len]
+    return str(sanitized_val)[:max_len]
 
 
 # ==============================================================================
@@ -204,7 +258,12 @@ def extract_json_skeleton(
                     }
                 return
             for key, val in curr.items():
-                next_path = f"{curr_path}.{key}" if curr_path else str(key)
+                key_str = str(key)
+                if key_str.isidentifier():
+                    next_path = f"{curr_path}.{key_str}" if curr_path else key_str
+                else:
+                    escaped_key = key_str.replace("\\", "\\\\").replace("'", "\\'")
+                    next_path = f"{curr_path}['{escaped_key}']" if curr_path else f"['{escaped_key}']"
                 _recurse(val, next_path)
 
         elif isinstance(curr, list):
@@ -289,9 +348,9 @@ def parse_dot_path(path: str) -> list[str | int] | None:
             if (content.startswith('"') and content.endswith('"')) or (
                 content.startswith("'") and content.endswith("'")
             ):
-                if len(content) < 2:
-                    return None
-                tokens.append(content[1:-1])
+                raw_token = content[1:-1]
+                unescaped = raw_token.replace(r"\'", "'").replace(r'\"', '"').replace(r"\\", "\\")
+                tokens.append(unescaped)
             elif content.isdigit():
                 tokens.append(int(content))
             elif content.startswith("-") and content[1:].isdigit():

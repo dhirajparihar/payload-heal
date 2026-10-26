@@ -9,24 +9,24 @@
 [![Pydantic v2](https://img.shields.io/badge/pydantic-v2-e92063.svg)](https://docs.pydantic.dev/)
 [![CI](https://github.com/dhirajparihar/payload-heal/actions/workflows/ci.yml/badge.svg)](https://github.com/dhirajparihar/payload-heal/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-54%20passed-brightgreen.svg)](https://github.com/dhirajparihar/payload-heal/actions)
+[![Tests](https://img.shields.io/badge/tests-67%20passed-brightgreen.svg)](https://github.com/dhirajparihar/payload-heal/actions)
 
-*Automatically recovers from renamed keys, camelCase drift, and nested wrapper mutations in 0ms.*
+*Resilient Pydantic v2 model recovery from renamed keys, casing drift, and nested wrapper mutations.*
 
 </div>
 
 ---
 
-## ⚡ The 5-Second Pitch
+## ⚡ The Overview
 
-Web scrapers and upstream API integrations **break at 2:00 AM** when an engineer renames `price_usd` to `productPrice`, wraps fields inside `data.listing.item`, or migrates to a new GraphQL schema.
+Web scrapers and upstream API integrations **break unexpectedly** when an upstream provider renames `price_usd` to `productPrice`, wraps fields inside `data.listing.item`, or migrates to a revised GraphQL schema.
 
-Calling an LLM on every scraped payload is **unusable**—it adds 800ms of latency, costs thousands of dollars per month, and leaks user PII to external endpoints.
+Calling an LLM on every incoming payload is impractical: it adds hundreds of milliseconds of latency, incurs compounding API costs, and risks leaking sensitive data to external endpoints.
 
 **`payload-heal`** provides a drop-in replacement for `pydantic.BaseModel` called **`HealableModel`** with a **3-tier hybrid self-healing engine**:
-- **0ms overhead, $0 cost** on healthy payloads.
-- **<1ms, $0 cost** heuristic auto-healing for 90% of schema drifts (casing, leaf promotion, prefix/suffix changes).
-- **Runs LLMs ONCE per schema drift** on a lightweight, PII-sanitized skeleton, commits the healed path into a local lockfile cache, and **never calls the LLM again**.
+- **Near-zero overhead (<0.1ms)** when incoming payloads are healthy.
+- **Fast, deterministic heuristic auto-healing ($0 cost)** for common schema drifts (casing changes, nested leaf promotion, token overlap).
+- **One-time AI recovery**: when heuristics cannot resolve an ambiguous drift, queries an LLM once on a lightweight, PII-sanitized skeleton, persists the verified mapping into a local lockfile cache, and **subsequently serves it from cache**.
 
 ---
 
@@ -37,24 +37,25 @@ Incoming JSON / GraphQL Payload
               │
               ▼
     [ All Required Fields Present? ]
-         ├─── YES ───► [ Fast Path: 0ms Overhead, $0 Cost ] ───► Validated Model
+         ├─── YES ───► [ Fast Path: <0.1ms Overhead, $0 Cost ] ───► Validated Model
          │
          └─── NO  (Schema Drift Detected!)
               │
               ├──► Tier 0: Lockfile Cache (.payload_heal_lock.json)
-              │         Lookup previously healed dot paths. (0ms, $0)
+              │         Lookup previously healed dot paths (<0.1ms, $0)
               │         *Re-Drift Guard: Auto-invalidates if upstream drifts a second time!
+              │         *Type Safety: Verifies cached values against model annotations.
               │
               ├──► Tier 1: Deterministic Heuristic Matcher
-              │         Zero-LLM instant recovery in <1ms. ($0)
+              │         Zero-LLM instant recovery (~1ms, $0)
               │         - camelCase / snake_case / kebab-case normalization
               │         - Nested leaf promotion (e.g., user_id -> data.user.id)
-              │         - Token overlap + SequenceMatcher type compatibility
+              │         - Global 1-to-1 candidate assignment across competing fields
               │         - Ambiguity protection (refuses to guess on tied confidence)
               │
               └──► Tier 2: AI Skeleton Healer
                         Invoked ONLY ONCE when heuristics cannot resolve drift.
-                        - Generates a 97% compressed, PII-masked JSON skeleton
+                        - Generates a compact, recursively sanitized JSON skeleton
                         - Queries OpenAI / Groq / Ollama / Gemini for path mapping
                         - Strict Type-Safety verification prevents cache poisoning
                         - Caches result in Tier 0 lockfile and alerts team via Webhook
@@ -172,13 +173,57 @@ def ingest_webhook(payload: dict):
 
 ---
 
-## 🛡️ Privacy-First PII Masking
+## 🛡️ Privacy & Security Safeguards
 
-Before any skeleton is sent to an external LLM endpoint, `payload-heal` automatically redacts sensitive data from preview samples:
-- **Email Addresses**: `user@domain.com` -> `[MASKED_EMAIL]`
-- **Bearer & JWT Tokens**: `Bearer eyJhbGci...` -> `Bearer [MASKED_TOKEN]`
-- **API Keys**: `sk-proj-1234...` -> `[MASKED_TOKEN]`
-- **Credit Cards**: `4111-2222-3333-4444` (and Luhn-validated sequences) -> `[MASKED_CREDIT_CARD]`
+### Recursive Secret & PII Sanitization
+Before any payload preview is processed or sent to an external LLM endpoint, `payload-heal` executes recursive sanitization:
+- **Sensitive Key Masking**: Dictionary keys indicating secrets (`password`, `api_key`, `token`, `secret`, `private_key`, `credentials`, `ssn`, `cvv`) automatically have their values redacted to `"[MASKED_SECRET]"`.
+- **Credential & Token Regexes**: API keys (`sk-`, `ghp-`, `glpat-`, `xoxb-`), AWS Access Keys (`AKIA...`), JWT tokens, and Bearer authorization headers are masked.
+- **Personal Identifiers**: Email addresses, US SSNs, and formatted or Luhn-valid credit card numbers are masked.
+- **Recursive Traversal**: Sanitization recurses through nested dictionaries and lists, ensuring deeply nested secrets in previews do not escape.
+
+> **Note on Privacy Guarantees**: Masking is best-effort pattern and heuristic redaction. For sensitive environments requiring strict compliance, use local providers like **Ollama** (`llm_provider="ollama"`) or disable AI calls entirely (`enable_ai=False`).
+
+### Webhook SSRF Protection
+Outbound schema drift notifications enforce security controls:
+- **Protocol Restrictions**: Only `http` and `https` schemes are accepted.
+- **Private & Internal IP Blocking**: Destination IPs resolving to loopback (`127.0.0.1`), private networks (`10.0.0.0/8`, `192.168.0.0/16`, `172.16.0.0/12`), link-local (`169.254.169.254`), or `localhost` are blocked by default to prevent Server-Side Request Forgery (SSRF).
+- **Host Allowlisting**: Use `HealConfig(allowed_webhook_hosts=["hooks.slack.com", "discord.com"])` to restrict webhook destinations to authorized hosts.
+- **Sanitized Logging**: Webhook path tokens, query parameters, and credentials are redacted in logs. Raw response bodies are omitted.
+
+### AI Prompt Injection Hardening
+Payload paths and preview samples are treated as untrusted data, enclosed within explicit `<untrusted_payload_skeleton>` boundaries, and accompanied by strict system instructions to reject prompt overrides embedded within candidate samples.
+
+---
+
+## ⚙️ Operational & Deployment Guide
+
+### Read-Only Filesystems (AWS Lambda / Serverless)
+By default, `payload-heal` writes cached mappings to `.payload_heal_lock.json`. In serverless environments with a read-only root filesystem, point the lockfile to a writable directory such as `/tmp`:
+```python
+HealConfig(lockfile_path=Path("/tmp/.payload_heal_lock.json"))
+```
+
+### Multi-Process Concurrency
+The `LockFileManager` ensures thread safety via `threading.RLock` and inter-process concurrency through atomic file locks (utilizing the cross-platform `filelock` package or native `msvcrt`/`fcntl` OS primitives). Updates are written to temporary files and atomically replaced via `os.replace`.
+
+### Offline & Air-Gapped Deployments
+To run completely offline with zero external network requests:
+```python
+# Pure deterministic heuristics only ($0 cost, 0 external calls)
+HealConfig(enable_ai=False)
+```
+
+### Model Cache Namespacing
+Lockfile entries are namespaced by module-qualified model identifiers (e.g. `myapp.models.Product`), preventing cached mapping collisions between models that share the same class name across different modules.
+
+---
+
+## ⚠️ Limitations & Fail-Safe Defaults
+
+- **Fail-Safe by Default**: If a candidate mapping is ambiguous, fails type compatibility against the Pydantic field annotation, or cannot be resolved, `payload-heal` rejects the mapping and allows standard Pydantic validation errors to be raised visibly.
+- **Ambiguity Refusal**: If multiple candidate paths tie in heuristic confidence within the configured margin (default: 0.05), the matcher refuses to guess to avoid data corruption.
+- **Best-Effort Heuristics**: Heuristic matching relies on structural casing, token Jaccard overlap, and sequence similarity. Radically transformed semantic drifts require Tier-2 AI or manual model updates.
 
 ---
 
@@ -189,7 +234,8 @@ Get notified in Slack or Discord the moment an upstream API drifts:
 ```python
 class MonitoredModel(HealableModel):
     heal_config: ClassVar[HealConfig] = HealConfig(
-        webhook_url="https://hooks.slack.com/services/T00/B00/X00"  # or Discord webhook
+        webhook_url="https://hooks.slack.com/services/T00/B00/X00",
+        allowed_webhook_hosts=["hooks.slack.com"]
     )
     price: float
 ```
@@ -213,36 +259,12 @@ Inspect skeletons and manage lockfiles from your terminal:
 # View all healed models and field mappings
 payload-heal status
 
-# Inspect a raw JSON file and view skeleton compression ratio
+# Inspect a raw JSON file and view skeleton structure
 payload-heal inspect scraper_dump.json
 
 # Reset cached mappings for a specific model (or all models)
 payload-heal reset ProductModel
 payload-heal reset
-```
-
----
-
-## 🏃 Try the Live Demo
-
-Run the self-contained scraper drift simulation:
-
-```bash
-python examples/demo_scraper_drift.py
-```
-
-Output:
-```text
-=====================================================================================
-  PAYLOAD-HEAL LIVE DEMO: Resilient Web Scraper Ingestion
-=====================================================================================
-Iteration    API State                      Tier Used              Latency    Status
--------------------------------------------------------------------------------------
-Run 1        v1 (Normal Schema)             Fast Path (0ms, $0)    0.074 ms   [OK] Ingested
-Run 2        v2 (camelCase + Nesting)       Tier-1 Heuristic ($0)  24.551 ms  [OK] Healed
-Run 3        v3 (Complete Rewrite)          Tier-2 AI Healer       46.463 ms  [OK] Healed & Cached
-Run 4        v3 Repeat Payload              Tier-0 Lockfile (0ms)  2.693 ms   [OK] 0ms Cache Hit
--------------------------------------------------------------------------------------
 ```
 
 ---
@@ -254,7 +276,7 @@ Run unit and integration tests across all modules:
 ```bash
 pytest -v
 ```
-All **54 tests** pass in ~4 seconds.
+All **67 tests** pass with coverage across heuristics, recursive PII redaction, AI healing, lockfile concurrency, SSRF protection, and end-to-end drift scenarios.
 
 ---
 

@@ -48,7 +48,14 @@ class HealConfig:
     api_base: str | None = None
     lockfile_path: Path = field(default_factory=lambda: Path(".payload_heal_lock.json"))
     webhook_url: str | None = None
+    allowed_webhook_hosts: list[str] | None = None
+    allow_internal_webhooks: bool = False
     timeout_seconds: float = 8.0
+
+    def clone(self) -> HealConfig:
+        """Returns an independent shallow/deep copy of this configuration."""
+        import copy
+        return copy.deepcopy(self)
 
     def __post_init__(self) -> None:
         if isinstance(self.lockfile_path, str):

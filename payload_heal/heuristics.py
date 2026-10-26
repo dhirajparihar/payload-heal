@@ -194,13 +194,21 @@ def extract_path_segments(path: str) -> list[str]:
 
     Example:
         `'data.items[0].pricing.priceUsd'` -> `['data', 'items', 'pricing', 'priceUsd']`
+        `"data['price.usd']"` -> `['data', 'price.usd']`
     """
     if not path or not isinstance(path, str):
         return []
 
-    # Strip array indices like [0] or [-1]
+    from payload_heal.skeleton import parse_dot_path
+
+    tokens = parse_dot_path(path)
+    if tokens is not None:
+        segments = [str(t) for t in tokens if isinstance(t, str)]
+        if segments:
+            return segments
+
+    # Fallback regex parsing
     cleaned = re.sub(r"\[-?\d+\]", "", path)
-    # Strip bracketed quoted keys: ['quoted_key'] -> .quoted_key
     cleaned = re.sub(r"\[['\"](.*?)['\"]\]", r".\1", cleaned)
 
     segments = [s for s in cleaned.split(".") if s]
@@ -274,8 +282,8 @@ def score_field_candidate(field_name: str, path: str) -> float:
     # 4. Target is an exact subset of leaf tokens (prefix/suffix addition)
     # e.g. target="title", leaf="item_title"
     if target_token_set.issubset(leaf_token_set):
-        score = 0.5 * recall + 0.3 * jaccard + 0.2 * sm_best + 0.15
-        return min(0.90, round(score, 4))
+        score = 0.5 * recall + 0.3 * jaccard + 0.2 * sm_best + 0.10
+        return min(0.86, round(score, 4))
 
     # Leaf is an exact subset of target tokens
     # e.g. target="item_title", leaf="title", parent="item"
@@ -347,11 +355,10 @@ def find_heuristic_matches(
                     continue
             field_candidates[field_name] = candidates
 
-    # 4. Resolve 1-to-1 assignments across fields (highest confidence first)
+    # 4. Resolve 1-to-1 assignments across fields globally (highest confidence first)
     all_pairs: list[tuple[float, str, str]] = []
     for field_name, cand_list in field_candidates.items():
-        if cand_list:
-            score, path = cand_list[0]
+        for score, path in cand_list:
             all_pairs.append((score, field_name, path))
 
     all_pairs.sort(key=lambda x: x[0], reverse=True)
