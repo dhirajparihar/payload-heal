@@ -140,10 +140,11 @@ class LockFileManager:
                 data["models"] = {}
             return data
         except Exception as exc:
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
             backup_path = self.lockfile_path.with_name(f"{self.lockfile_path.name}.corrupted.{timestamp}.bak")
             try:
                 shutil.copy2(self.lockfile_path, backup_path)
+                self._rotate_backups(max_backups=5)
                 logger.warning(
                     "Lockfile at '%s' is corrupted or invalid (%s). Preserved backup at '%s'. Returning empty lockfile structure.",
                     self.lockfile_path,
@@ -158,6 +159,20 @@ class LockFileManager:
                     copy_err,
                 )
             return {"version": "1.0", "models": {}}
+
+    def _rotate_backups(self, max_backups: int = 5) -> None:
+        """Retains at most `max_backups` recent corrupted backup files, purging older ones."""
+        try:
+            pattern = f"{self.lockfile_path.name}.corrupted.*.bak"
+            parent = self.lockfile_path.parent
+            backups = sorted(parent.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+            for old_bak in backups[max_backups:]:
+                try:
+                    old_bak.unlink()
+                except OSError:
+                    pass
+        except Exception as err:
+            logger.debug("Failed to rotate lockfile backups: %s", err)
 
     def _write_raw(self, data: dict[str, Any]) -> None:
         """Atomically writes data to the lockfile path via tempfile + os.replace."""

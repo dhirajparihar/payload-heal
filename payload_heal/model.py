@@ -26,19 +26,62 @@ from payload_heal.skeleton import extract_json_skeleton, get_by_dot_path
 logger = logging.getLogger("payload_heal.model")
 
 
-def get_model_identifier(schema: type[BaseModel] | str) -> str:
+def get_model_identifier(schema: type[BaseModel] | str, config: HealConfig | None = None) -> str:
     """Returns a unique, stable identifier for a Pydantic model class.
 
-    Combines module and class name (e.g. `myapp.models.Product`)
-    to prevent cross-model cached mapping collisions.
+    Priority:
+    1. Explicit class-level attribute `model_cache_id`
+    2. Explicit `config.model_cache_id`
+    3. Module-qualified class name (e.g. `myapp.models.Product`)
+    4. Short class name fallback for __main__
     """
     if isinstance(schema, str):
         return schema
+
+    # 1. Config-level explicit cache identifier (runtime override)
+    if config and config.model_cache_id:
+        return str(config.model_cache_id)
+
+    # 2. Explicit model-level cache identifier
+    explicit_class_id = getattr(schema, "model_cache_id", None)
+    if explicit_class_id:
+        return str(explicit_class_id)
+
     mod = getattr(schema, "__module__", "")
     name = getattr(schema, "__name__", "Model")
     if mod and mod not in ("__main__", "builtins"):
         return f"{mod}.{name}"
     return name
+
+
+def validate_field_candidate(
+    field_info: FieldInfo,
+    field_name: str,
+    value: Any,
+) -> tuple[bool, Any]:
+    """Validates a candidate healed value against the field's actual Pydantic schema and constraints.
+
+    Enforces:
+    - Base type coercion (e.g., numeric string "49.99" -> float 49.99)
+    - Numeric constraints: gt, ge, lt, le, multiple_of
+    - String constraints: min_length, max_length, pattern regexes
+    - Literal, Enum, Union, and nested model schemas
+
+    Returns:
+        (is_valid, validated_coerced_value)
+    """
+    try:
+        from pydantic import create_model, ValidationError
+
+        # Construct a temporary single-field validation model
+        validator_model = create_model(
+            "_CandidateValidator",
+            **{field_name: (field_info.annotation, field_info)},
+        )
+        instance = validator_model(**{field_name: value})
+        return True, getattr(instance, field_name)
+    except (ValidationError, Exception):
+        return False, None
 
 
 def get_field_type_str(field_info: FieldInfo) -> str:
@@ -60,9 +103,9 @@ def auto_heal_dict(
     """Applies the 3-tier healing pipeline to an incoming dictionary payload.
 
     Tiers:
-    0. Fast Path & Lockfile cache lookup (with type verification)
-    1. Heuristic matcher (with type verification)
-    2. AI Skeleton Healer (LLM query with strict type-safety verification)
+    0. Fast Path & Lockfile cache lookup (with full Pydantic constraint validation)
+    1. Heuristic matcher (with full Pydantic constraint validation)
+    2. AI Skeleton Healer (with full Pydantic constraint validation)
 
     Returns:
         The updated dictionary containing healed field values.
@@ -97,19 +140,22 @@ def auto_heal_dict(
             source_path = cached_mappings[field_name]
             found, val = get_by_dot_path(data, source_path)
             if found:
-                # Critical Safety Check: verify type compatibility for cached values
-                expected_type = get_field_type_str(missing_fields[field_name])
+                field_info = missing_fields[field_name]
+                expected_type = get_field_type_str(field_info)
                 actual_type = type(val).__name__ if val is not None else "null"
-                if is_type_compatible(expected_type, actual_type, val):
-                    healed_data[field_name] = val
+
+                # Safety Check: Structural compatibility filter + full Pydantic constraint check
+                type_ok = is_type_compatible(expected_type, actual_type, val)
+                valid, validated_val = validate_field_candidate(field_info, field_name, val) if type_ok else (False, None)
+
+                if valid:
+                    healed_data[field_name] = validated_val
                 else:
                     logger.warning(
-                        "Cached path '%s' for field '%s' contains incompatible value %r (expected '%s', got '%s'). Invalidating cache.",
+                        "Cached path '%s' for field '%s' with value %r failed Pydantic field validation. Invalidating cache.",
                         source_path,
                         field_name,
                         val,
-                        expected_type,
-                        actual_type,
                     )
                     lock_manager.invalidate_field(model_name, field_name)
             else:
@@ -146,14 +192,19 @@ def auto_heal_dict(
         for field_name, source_path in heuristic_matches.items():
             found, val = get_by_dot_path(data, source_path)
             if found:
-                # Critical Safety Check: verify type compatibility before saving heuristic match
-                expected_type = get_field_type_str(remaining_missing[field_name])
+                field_info = remaining_missing[field_name]
+                expected_type = get_field_type_str(field_info)
                 actual_type = skeleton.get(source_path, {}).get(
                     "type",
                     type(val).__name__ if val is not None else "null",
                 )
-                if is_type_compatible(expected_type, actual_type, val):
-                    healed_data[field_name] = val
+
+                # Safety Check: Structural filter + full Pydantic constraint check
+                type_ok = is_type_compatible(expected_type, actual_type, val)
+                valid, validated_val = validate_field_candidate(field_info, field_name, val) if type_ok else (False, None)
+
+                if valid:
+                    healed_data[field_name] = validated_val
                     lock_manager.save_mapping(
                         model_name,
                         field_name,
@@ -163,11 +214,10 @@ def auto_heal_dict(
                     healed_notifications[field_name] = (source_path, "heuristic")
                 else:
                     logger.warning(
-                        "Heuristic suggested '%s' -> '%s' with value %r, which fails type compatibility with '%s'. Discarding.",
+                        "Heuristic match '%s' -> '%s' with value %r failed Pydantic field validation. Discarding.",
                         field_name,
                         source_path,
                         val,
-                        expected_type,
                     )
 
         remaining_missing = {
@@ -195,14 +245,19 @@ def auto_heal_dict(
         for field_name, source_path in ai_matches.items():
             found, val = get_by_dot_path(data, source_path)
             if found:
-                # Critical Safety Check: verify type compatibility before saving
-                expected_type = get_field_type_str(remaining_missing[field_name])
+                field_info = remaining_missing[field_name]
+                expected_type = get_field_type_str(field_info)
                 actual_type = skeleton.get(source_path, {}).get(
                     "type",
                     type(val).__name__ if val is not None else "null",
                 )
-                if is_type_compatible(expected_type, actual_type, val):
-                    healed_data[field_name] = val
+
+                # Safety Check: Structural filter + full Pydantic constraint check
+                type_ok = is_type_compatible(expected_type, actual_type, val)
+                valid, validated_val = validate_field_candidate(field_info, field_name, val) if type_ok else (False, None)
+
+                if valid:
+                    healed_data[field_name] = validated_val
                     lock_manager.save_mapping(
                         model_name,
                         field_name,
@@ -212,11 +267,10 @@ def auto_heal_dict(
                     healed_notifications[field_name] = (source_path, "ai")
                 else:
                     logger.warning(
-                        "AI suggested '%s' -> '%s' with value %r, which fails type compatibility with '%s'. Discarding.",
+                        "AI suggested '%s' -> '%s' with value %r failed Pydantic field validation. Discarding.",
                         field_name,
                         source_path,
                         val,
-                        expected_type,
                     )
 
     # Dispatch drift alert notification if any fields were newly healed
@@ -230,6 +284,7 @@ class HealableModel(BaseModel):
     """Drop-in replacement for pydantic.BaseModel with 3-tier self-healing capabilities."""
 
     heal_config: ClassVar[HealConfig] = HealConfig()
+    model_cache_id: ClassVar[str | None] = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -254,7 +309,7 @@ class HealableModel(BaseModel):
 
         return auto_heal_dict(
             data=data,
-            model_name=get_model_identifier(cls),
+            model_name=get_model_identifier(cls, config),
             model_fields=cls.model_fields,
             config=config,
         )
@@ -272,7 +327,7 @@ def heal_payload(
     cfg = config or getattr(schema, "heal_config", None) or HealConfig()
     return auto_heal_dict(
         data=data,
-        model_name=get_model_identifier(schema),
+        model_name=get_model_identifier(schema, cfg),
         model_fields=schema.model_fields,
         config=cfg,
     )

@@ -13,9 +13,9 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
@@ -23,3 +23,25 @@ jobs:
           pip install -e ".[dev]"
       - name: Run pytest
         run: pytest -v
+
+  package-install-test:
+    name: Build Wheel and Verify Clean Installation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+      - name: Build wheel
+        run: |
+          pip install build
+          python -m build --wheel
+      - name: Install built wheel
+        run: |
+          pip install dist/*.whl
+      - name: Test quickstart import and CLI from installed wheel
+        run: |
+          python -c "import payload_heal; print(payload_heal.__file__)"
+          python -c "from payload_heal import HealableModel, HealConfig; print('Wheel imports cleanly!')"
+          payload-heal --help

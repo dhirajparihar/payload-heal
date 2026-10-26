@@ -46,10 +46,13 @@ class HealConfig:
     model: str | None = None
     api_key: str | None = None
     api_base: str | None = None
+    model_cache_id: str | None = None
     lockfile_path: Path = field(default_factory=lambda: Path(".payload_heal_lock.json"))
     webhook_url: str | None = None
     allowed_webhook_hosts: list[str] | None = None
     allow_internal_webhooks: bool = False
+    allowed_ai_hosts: list[str] | None = None
+    allow_insecure_ai_endpoints: bool = False
     timeout_seconds: float = 8.0
 
     def clone(self) -> HealConfig:
@@ -74,6 +77,31 @@ class HealConfig:
                 provider_lower,
                 "https://api.openai.com/v1",
             )
+
+        # Validate AI endpoint security & trust boundary
+        if self.api_base:
+            from urllib.parse import urlsplit
+            parsed_base = urlsplit(self.api_base)
+            scheme = (parsed_base.scheme or "").lower()
+            if scheme not in ("http", "https"):
+                raise ValueError(f"Invalid AI api_base scheme '{scheme}': must be http or https")
+
+            host = (parsed_base.hostname or "").lower()
+            # Non-local endpoints must use HTTPS unless allow_insecure_ai_endpoints is explicitly True
+            if scheme == "http" and host not in ("localhost", "127.0.0.1", "::1") and not self.allow_insecure_ai_endpoints:
+                raise ValueError(
+                    f"Insecure HTTP AI endpoint '{self.api_base}' is disallowed for non-local hosts. "
+                    "Use HTTPS or set allow_insecure_ai_endpoints=True if explicitly required."
+                )
+
+            # Check AI host allowlist if configured
+            if self.allowed_ai_hosts:
+                matched = any(
+                    host == h.lower() or host.endswith(f".{h.lower()}")
+                    for h in self.allowed_ai_hosts
+                )
+                if not matched:
+                    raise ValueError(f"AI endpoint host '{host}' is not in configured allowed_ai_hosts")
 
         # Resolve API key from environment if not explicitly set
         if not self.api_key:

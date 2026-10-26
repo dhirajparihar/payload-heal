@@ -298,6 +298,119 @@ def score_field_candidate(field_name: str, path: str) -> float:
     return round(score, 4)
 
 
+def solve_max_weight_bipartite_matching(
+    field_candidates: dict[str, list[tuple[float, str]]],
+) -> dict[str, str]:
+    """Finds the global maximum-weight bipartite matching between fields and paths.
+
+    Solves the assignment problem to optimality using the Kuhn-Munkres (Hungarian)
+    algorithm in O(N^3) time. Prevents greedy heuristic choices from taking candidate
+    paths that would lead to a lower total overall matching score.
+
+    Parameters:
+        field_candidates: Mapping of `field_name -> [(score, path), ...]`.
+
+    Returns:
+        Mapping of `field_name -> matched_path`.
+    """
+    fields = list(field_candidates.keys())
+    if not fields:
+        return {}
+
+    # Collect all unique candidate paths across all fields
+    all_paths_set: set[str] = set()
+    for cands in field_candidates.values():
+        for _, path in cands:
+            all_paths_set.add(path)
+    paths = list(all_paths_set)
+    if not paths:
+        return {}
+
+    n = max(len(fields), len(paths))
+    cost_matrix = [[0.0] * n for _ in range(n)]
+
+    field_idx = {f: i for i, f in enumerate(fields)}
+    path_idx = {p: j for j, p in enumerate(paths)}
+
+    for f, cands in field_candidates.items():
+        i = field_idx[f]
+        for score, p in cands:
+            j = path_idx[p]
+            cost_matrix[i][j] = max(cost_matrix[i][j], float(score))
+
+    # Kuhn-Munkres Maximum-Weight Bipartite Matching
+    u_val = [max(row) for row in cost_matrix]
+    v_val = [0.0] * n
+    match_v = [-1] * n  # match_v[j] = i (field i assigned to path j)
+
+    for i in range(n):
+        slack = [float("inf")] * n
+        slack_x = [-1] * n
+        links = [-1] * n
+        visited_x = [False] * n
+        visited_y = [False] * n
+
+        current_x = i
+        visited_x[current_x] = True
+        for j in range(n):
+            diff = u_val[current_x] + v_val[j] - cost_matrix[current_x][j]
+            if diff < slack[j]:
+                slack[j] = diff
+                slack_x[j] = current_x
+
+        matched_y = -1
+        while matched_y == -1:
+            delta = float("inf")
+            next_y = -1
+            for j in range(n):
+                if not visited_y[j] and slack[j] < delta:
+                    delta = slack[j]
+                    next_y = j
+
+            for x in range(n):
+                if visited_x[x]:
+                    u_val[x] -= delta
+            for y in range(n):
+                if visited_y[y]:
+                    v_val[y] += delta
+                else:
+                    slack[y] -= delta
+
+            visited_y[next_y] = True
+            links[next_y] = slack_x[next_y]
+
+            if match_v[next_y] == -1:
+                matched_y = next_y
+            else:
+                next_x = match_v[next_y]
+                visited_x[next_x] = True
+                for j in range(n):
+                    if not visited_y[j]:
+                        diff = u_val[next_x] + v_val[j] - cost_matrix[next_x][j]
+                        if diff < slack[j]:
+                            slack[j] = diff
+                            slack_x[j] = next_x
+
+        curr_y = matched_y
+        while curr_y != -1:
+            prev_x = links[curr_y]
+            prev_y = -1
+            for j in range(n):
+                if match_v[j] == prev_x:
+                    prev_y = j
+                    break
+            match_v[curr_y] = prev_x
+            curr_y = prev_y
+
+    results: dict[str, str] = {}
+    for j, i in enumerate(match_v):
+        if i != -1 and i < len(fields) and j < len(paths):
+            if cost_matrix[i][j] > 0.0:
+                results[fields[i]] = paths[j]
+
+    return results
+
+
 # ==============================================================================
 # Heuristic Matcher Core
 # ==============================================================================
@@ -355,22 +468,5 @@ def find_heuristic_matches(
                     continue
             field_candidates[field_name] = candidates
 
-    # 4. Resolve 1-to-1 assignments across fields globally (highest confidence first)
-    all_pairs: list[tuple[float, str, str]] = []
-    for field_name, cand_list in field_candidates.items():
-        for score, path in cand_list:
-            all_pairs.append((score, field_name, path))
-
-    all_pairs.sort(key=lambda x: x[0], reverse=True)
-
-    assigned_paths: set[str] = set()
-    assigned_fields: set[str] = set()
-    matches: dict[str, str] = {}
-
-    for score, field_name, path in all_pairs:
-        if field_name not in assigned_fields and path not in assigned_paths:
-            matches[field_name] = path
-            assigned_fields.add(field_name)
-            assigned_paths.add(path)
-
-    return matches
+    # 4. Resolve global maximum-weight bipartite matching
+    return solve_max_weight_bipartite_matching(field_candidates)

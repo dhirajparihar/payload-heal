@@ -21,10 +21,16 @@ import pytest
 from pydantic import BaseModel, Field
 
 from payload_heal.config import HealConfig
-from payload_heal.heuristics import find_heuristic_matches
+from payload_heal.heuristics import find_heuristic_matches, solve_max_weight_bipartite_matching
 from payload_heal.lockfile import LockFileManager
 from payload_heal.model import HealableModel, auto_heal_dict, get_model_identifier
-from payload_heal.notifier import is_safe_webhook_url, sanitize_url_for_logging, send_drift_notification
+from payload_heal.notifier import (
+    SSRFSafeBackend,
+    SSRFSafeTransport,
+    is_safe_webhook_url,
+    sanitize_url_for_logging,
+    send_drift_notification,
+)
 from payload_heal.skeleton import (
     extract_json_skeleton,
     format_sample_preview,
@@ -340,3 +346,197 @@ def test_dotted_and_bracketed_keys_extraction_and_traversal():
     found2, val2 = get_by_dot_path(payload, "nested['rate.eur']")
     assert found2 is True
     assert val2 == 85.50
+
+
+# ==============================================================================
+# 10. Pydantic Constraint Validation Across Healing Pipeline
+# ==============================================================================
+
+def test_healed_candidate_rejected_if_pydantic_constraint_fails(tmp_path: Path):
+    """Verifies that candidates satisfying structural type check (e.g. float) are rejected
+    if they violate specific Pydantic constraints such as Field(gt=0).
+    """
+    class StockItem(HealableModel):
+        price: float = Field(gt=0)
+
+    lockfile = tmp_path / "lock.json"
+    cfg = HealConfig(lockfile_path=lockfile, enable_heuristics=True, enable_ai=False)
+
+    # Payload contains candidate 'unit_price', but value is -15.0 (violates gt=0)
+    payload = {"unit_price": -15.0}
+
+    # Should raise ValidationError because -15.0 fails Field(gt=0), not silently accept it!
+    with pytest.raises(Exception):
+        StockItem.model_validate(payload, config=cfg)
+
+
+def test_healed_candidate_rejected_for_regex_pattern_violation(tmp_path: Path):
+    """Verifies candidate strings violating regex pattern constraints are rejected."""
+    class Account(HealableModel):
+        account_code: str = Field(pattern=r"^[A-Z]{3}-\d{4}$")
+
+    lockfile = tmp_path / "lock.json"
+    cfg = HealConfig(lockfile_path=lockfile, enable_heuristics=True, enable_ai=False)
+
+    # Invalid format string
+    payload = {"code": "invalid-code"}
+
+    with pytest.raises(Exception):
+        Account.model_validate(payload, config=cfg)
+
+
+# ==============================================================================
+# 11. Bipartite Matching Optimality vs Greedy Assignment
+# ==============================================================================
+
+def test_bipartite_matching_achieves_global_optimum_over_greedy():
+    """Verifies that solve_max_weight_bipartite_matching finds the global maximum score
+    in cases where greedy sorting would strand a field and yield a suboptimal total score.
+    """
+    # Field 1: PathA (0.90), PathB (0.85)
+    # Field 2: PathA (0.89)
+    # Greedy takes (Field 1 -> PathA) = 0.90, stranding Field 2 -> Total = 0.90
+    # Optimal takes (Field 2 -> PathA: 0.89) and (Field 1 -> PathB: 0.85) -> Total = 1.74
+    field_candidates = {
+        "field1": [(0.90, "pricing.path_a"), (0.85, "pricing.path_b")],
+        "field2": [(0.89, "pricing.path_a")],
+    }
+
+    result = solve_max_weight_bipartite_matching(field_candidates)
+
+    assert result["field2"] == "pricing.path_a"
+    assert result["field1"] == "pricing.path_b"
+
+
+# ==============================================================================
+# 12. Webhook DNS Rebinding & Connect-Time SSRF Blocking
+# ==============================================================================
+
+def test_ssrf_safe_backend_blocks_internal_ip_at_connect_time():
+    """Verifies SSRFSafeBackend intercepts and blocks connections to private IPs at connect time."""
+    backend = SSRFSafeBackend(allow_internal=False)
+
+    from httpcore._exceptions import ConnectError
+    import httpx
+
+    transport = SSRFSafeTransport(allow_internal=False)
+    with pytest.raises(httpx.ConnectError):
+        with httpx.Client(transport=transport) as client:
+            client.get("http://127.0.0.1:9999/status")
+
+
+def test_webhook_redirect_to_internal_ip_is_blocked():
+    """Verifies that an external webhook redirecting to an internal IP is blocked."""
+    config = HealConfig(
+        webhook_url="https://hooks.example.com/drift",
+        allowed_webhook_hosts=["hooks.example.com"],
+        allow_internal_webhooks=False,
+    )
+
+    # Mock response returning a 302 redirect to http://127.0.0.1/admin
+    mock_redirect_resp = MagicMock()
+    mock_redirect_resp.is_redirect = True
+    mock_redirect_resp.headers = {"Location": "http://127.0.0.1/admin"}
+
+    with patch("payload_heal.notifier.is_safe_webhook_url") as mock_url_check:
+        # First call (initial URL) is safe, second call (redirect target) is unsafe
+        mock_url_check.side_effect = [
+            (True, ""),
+            (False, "Destination IP 127.0.0.1 is an internal address"),
+        ]
+        with patch("httpx.Client.post", return_value=mock_redirect_resp):
+            success = send_drift_notification("TestModel", {"price": ("val", "heuristic")}, config)
+            assert success is False
+
+
+# ==============================================================================
+# 13. Arbitrary JSON Path Escaping & Literal Closing Brackets
+# ==============================================================================
+
+def test_parse_dot_path_with_literal_closing_brackets_and_quotes():
+    """Verifies parse_dot_path properly parses keys containing literal ] and escaped quotes."""
+    path1 = "data['item[0]'].price"
+    tokens1 = parse_dot_path(path1)
+    assert tokens1 == ["data", "item[0]", "price"]
+
+    path2 = "data['nested]bracket]key']"
+    tokens2 = parse_dot_path(path2)
+    assert tokens2 == ["data", "nested]bracket]key"]
+
+    path3 = "data['key\\'with\\'quotes']"
+    tokens3 = parse_dot_path(path3)
+    assert tokens3 == ["data", "key'with'quotes"]
+
+    # Traversal test
+    data = {
+        "data": {
+            "item[0]": {"price": 42.0},
+            "nested]bracket]key": "found",
+        }
+    }
+    found1, val1 = get_by_dot_path(data, path1)
+    assert found1 is True
+    assert val1 == 42.0
+
+    found2, val2 = get_by_dot_path(data, path2)
+    assert found2 is True
+    assert val2 == "found"
+
+
+# ==============================================================================
+# 14. Adversarial Payload Sanitization & Alternate Credentials
+# ==============================================================================
+
+def test_sanitization_against_unicode_homoglyphs_and_alternate_secrets():
+    """Verifies detection of unicode homoglyphs, basic auth, refresh tokens, and deep nests."""
+    payload = {
+        "ａｐｉ_ｋｅｙ": "secret_key_12345",  # full-width unicode
+        "auth_header": "Basic dXNlcjpwYXNzd29yZA==",
+        "session_pin": 1234,
+        "deep": {"l1": {"l2": {"l3": {"l4": {"l5": {"l6": "too_deep"}}}}}},
+    }
+
+    sanitized = sanitize_data_recursively(payload, max_depth=5)
+
+    assert sanitized["ａｐｉ_ｋｅｙ"] == "[MASKED_SECRET]"
+    assert "Basic [MASKED_TOKEN]" in sanitized["auth_header"]
+    assert sanitized["session_pin"] == "[MASKED_SECRET]"
+    assert sanitized["deep"]["l1"]["l2"]["l3"]["l4"] == "[TRUNCATED]"
+
+
+# ==============================================================================
+# 15. Lockfile Backup Rotation
+# ==============================================================================
+
+def test_lockfile_backup_rotation_limits_retained_files(tmp_path: Path):
+    """Verifies that repeatedly corrupting a lockfile produces at most 5 .bak files."""
+    lock_path = tmp_path / "app.lock.json"
+    mgr = LockFileManager(lock_path)
+
+    for i in range(8):
+        lock_path.write_text(f"invalid json {i}", encoding="utf-8")
+        _ = mgr.get_mapping("TestModel")
+
+    backup_files = list(tmp_path.glob("*.bak"))
+    assert len(backup_files) <= 5
+
+
+# ==============================================================================
+# 16. Model Cache Namespace Override (model_cache_id)
+# ==============================================================================
+
+def test_model_cache_id_namespace_override(tmp_path: Path):
+    """Verifies that setting model_cache_id cleanly isolates model caches across entrypoints."""
+    class CustomEntryModel(HealableModel):
+        model_cache_id: ClassVar[str | None] = "service_v2.CustomEntryModel"
+        item_id: int
+
+    lock_path = tmp_path / "lock.json"
+    cfg = HealConfig(lockfile_path=lock_path, model_cache_id="explicit_namespace_override")
+
+    # When config has model_cache_id, it is used
+    assert get_model_identifier(CustomEntryModel, cfg) == "explicit_namespace_override"
+
+    # When config does not have it, class-level model_cache_id is used
+    cfg_default = HealConfig(lockfile_path=lock_path)
+    assert get_model_identifier(CustomEntryModel, cfg_default) == "service_v2.CustomEntryModel"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any
 
 # ==============================================================================
@@ -23,6 +24,10 @@ _EMAIL_RE = re.compile(
 
 _BEARER_RE = re.compile(
     r"(?i)\bbearer\s+[A-Za-z0-9\-_.~+/]+=*",
+)
+
+_BASIC_AUTH_RE = re.compile(
+    r"(?i)\bbasic\s+[A-Za-z0-9+/=]{8,}",
 )
 
 _JWT_RE = re.compile(
@@ -46,7 +51,7 @@ _PRIVATE_KEY_RE = re.compile(
 )
 
 _SENSITIVE_KEY_PATTERNS = re.compile(
-    r"(?i)(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|bearer|credentials?|ssn|social[_-]?security|cvv|cvc|token)"
+    r"(?i)(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|private[_-]?key|bearer|credentials?|ssn|social[_-]?security|cvv|cvc|pin|card[_-]?number|credit[_-]?card|token|session|cookie)"
 )
 
 # Standard credit card formats: 16-digit cards with separators or 15-digit Amex
@@ -88,6 +93,8 @@ def mask_pii(text: str) -> str:
     text = _PRIVATE_KEY_RE.sub("[MASKED_PRIVATE_KEY]", text)
     # Mask bearer tokens and headers
     text = _BEARER_RE.sub("Bearer [MASKED_TOKEN]", text)
+    # Mask basic auth credentials
+    text = _BASIC_AUTH_RE.sub("Basic [MASKED_TOKEN]", text)
     # Mask JWTs
     text = _JWT_RE.sub("[MASKED_TOKEN]", text)
     # Mask API keys
@@ -118,6 +125,7 @@ def sanitize_data_recursively(data: Any, max_depth: int = 5) -> Any:
 
     - Replaces sensitive dictionary keys' values with '[MASKED_SECRET]'
     - Masks PII patterns (emails, tokens, API keys, SSNs, credit cards) in all strings
+    - Normalizes Unicode homoglyphs and compatibility forms in key names
     - Recursively traverses nested structures up to max_depth
     """
     if max_depth <= 0:
@@ -127,7 +135,9 @@ def sanitize_data_recursively(data: Any, max_depth: int = 5) -> Any:
         sanitized: dict[str, Any] = {}
         for k, v in data.items():
             k_str = str(k)
-            if _SENSITIVE_KEY_PATTERNS.search(k_str):
+            # Normalize Unicode to detect homoglyphs and diacritics
+            norm_k = unicodedata.normalize("NFKD", k_str)
+            if _SENSITIVE_KEY_PATTERNS.search(k_str) or _SENSITIVE_KEY_PATTERNS.search(norm_k):
                 sanitized[k_str] = "[MASKED_SECRET]"
             else:
                 sanitized[k_str] = sanitize_data_recursively(v, max_depth - 1)
@@ -337,29 +347,68 @@ def parse_dot_path(path: str) -> list[str | int] | None:
             continue
 
         if char == "[":
-            close_idx = path.find("]", i)
-            if close_idx == -1:
-                return None
-            content = path[i + 1:close_idx].strip()
-            if not content:
+            i += 1
+            # Skip optional whitespace
+            while i < n and path[i].isspace():
+                i += 1
+            if i >= n:
                 return None
 
-            # Quoted key inside brackets: ['foo'] or ["foo"]
-            if (content.startswith('"') and content.endswith('"')) or (
-                content.startswith("'") and content.endswith("'")
-            ):
-                raw_token = content[1:-1]
-                unescaped = raw_token.replace(r"\'", "'").replace(r'\"', '"').replace(r"\\", "\\")
-                tokens.append(unescaped)
-            elif content.isdigit():
-                tokens.append(int(content))
-            elif content.startswith("-") and content[1:].isdigit():
-                tokens.append(int(content))
-            elif content.isidentifier():
-                tokens.append(content)
+            quote_char = path[i]
+            if quote_char in ("'", '"'):
+                i += 1
+                token_chars: list[str] = []
+                closed_quote = False
+                while i < n:
+                    c = path[i]
+                    if c == "\\":
+                        if i + 1 < n:
+                            next_c = path[i + 1]
+                            if next_c in ("'", '"', "\\"):
+                                token_chars.append(next_c)
+                                i += 2
+                                continue
+                            else:
+                                token_chars.append(c)
+                                i += 1
+                                continue
+                        else:
+                            return None
+                    elif c == quote_char:
+                        closed_quote = True
+                        i += 1
+                        break
+                    else:
+                        token_chars.append(c)
+                        i += 1
+
+                if not closed_quote:
+                    return None
+
+                while i < n and path[i].isspace():
+                    i += 1
+                if i >= n or path[i] != "]":
+                    return None
+                i += 1
+                tokens.append("".join(token_chars))
             else:
-                return None
-            i = close_idx + 1
+                bracket_start = i
+                while i < n and path[i] != "]":
+                    i += 1
+                if i >= n:
+                    return None
+                content = path[bracket_start:i].strip()
+                i += 1
+                if not content:
+                    return None
+                if content.isdigit():
+                    tokens.append(int(content))
+                elif content.startswith("-") and content[1:].isdigit():
+                    tokens.append(int(content))
+                elif content.isidentifier():
+                    tokens.append(content)
+                else:
+                    return None
         else:
             # Identifier segment up to next '.' or '['
             start = i

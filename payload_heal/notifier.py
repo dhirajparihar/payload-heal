@@ -42,6 +42,18 @@ def sanitize_url_for_logging(url: str) -> str:
         return "[REDACTED_URL]"
 
 
+def is_safe_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Returns True if an IP is globally routable and not internal/loopback/private."""
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
 def is_safe_webhook_url(
     url: str,
     allowed_hosts: list[str] | None = None,
@@ -84,7 +96,7 @@ def is_safe_webhook_url(
     # Check for localhost / loopback / private IP SSRF
     try:
         ip = ipaddress.ip_address(hostname)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+        if not is_safe_ip(ip):
             return False, f"Destination IP {ip} is an internal or private network address"
         return True, ""
     except ValueError:
@@ -102,13 +114,127 @@ def is_safe_webhook_url(
             sockaddr = entry[4]
             ip_str = sockaddr[0]
             ip = ipaddress.ip_address(ip_str)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            if not is_safe_ip(ip):
                 return False, f"Resolved host IP {ip} is an internal or private network address"
     except Exception as exc:
         logger.warning("DNS resolution check failed for host '%s': %s", hostname, exc)
         return False, f"Unable to resolve host '{hostname}'"
 
     return True, ""
+
+
+# ==============================================================================
+# SSRF-Safe Request-Time Socket Backend & Transport
+# ==============================================================================
+
+import httpcore
+from httpcore._backends.sync import SyncBackend, SyncStream
+from httpcore._exceptions import ConnectError, ConnectTimeout, ExceptionMapping, map_exceptions
+from urllib.parse import urljoin
+
+
+class SSRFSafeBackend(SyncBackend):
+    """Custom HTTPCore network backend that enforces IP safety at connection time.
+
+    Defends against DNS rebinding (TOCTOU) attacks by resolving and verifying the
+    exact IP address right when opening the TCP socket, while allowing TLS to verify
+    the original hostname.
+    """
+
+    def __init__(
+        self,
+        allowed_hosts: list[str] | None = None,
+        allow_internal: bool = False,
+    ) -> None:
+        self.allowed_hosts = allowed_hosts
+        self.allow_internal = allow_internal
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> SyncStream:
+        if socket_options is None:
+            socket_options = []
+
+        # Enforce host allowlist at socket connection time
+        if self.allowed_hosts:
+            host_lower = host.lower()
+            matched = any(
+                host_lower == h.lower() or host_lower.endswith(f".{h.lower()}")
+                for h in self.allowed_hosts
+            )
+            if not matched:
+                raise ConnectError(f"Host '{host}' is not in allowed webhook hosts list")
+
+        if not self.allow_internal:
+            # Resolve destination IP at the moment of connection
+            try:
+                addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            except Exception as exc:
+                raise ConnectError(f"DNS resolution failed for '{host}': {exc}") from exc
+
+            safe_addr: tuple[str, int] | None = None
+            for family, socktype, proto, canonname, sockaddr in addr_info:
+                ip_str = sockaddr[0]
+                try:
+                    ip = ipaddress.ip_address(ip_str)
+                    if not is_safe_ip(ip):
+                        continue
+                    safe_addr = (ip_str, sockaddr[1])
+                    break
+                except ValueError:
+                    continue
+
+            if safe_addr is None:
+                raise ConnectError(
+                    f"Connection blocked: host '{host}' resolved to private/internal IP address(es) at connection time"
+                )
+
+            target_address = safe_addr
+        else:
+            target_address = (host, port)
+
+        source_address = None if local_address is None else (local_address, 0)
+        exc_map: ExceptionMapping = {
+            socket.timeout: ConnectTimeout,
+            OSError: ConnectError,
+        }
+
+        with map_exceptions(exc_map):
+            sock = socket.create_connection(
+                target_address,
+                timeout,
+                source_address=source_address,
+            )
+            for option in socket_options:
+                sock.setsockopt(*option)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return SyncStream(sock)
+
+
+class SSRFSafeTransport(httpx.HTTPTransport):
+    """HTTPX Transport powered by SSRFSafeBackend to protect against DNS rebinding."""
+
+    def __init__(
+        self,
+        allowed_hosts: list[str] | None = None,
+        allow_internal: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        self.allowed_hosts = allowed_hosts
+        self.allow_internal = allow_internal
+        super().__init__(**kwargs)
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=self._pool._ssl_context,
+            network_backend=SSRFSafeBackend(
+                allowed_hosts=allowed_hosts,
+                allow_internal=allow_internal,
+            ),
+        )
 
 
 def send_drift_notification(
@@ -175,17 +301,49 @@ def send_drift_notification(
     timeout = min(config.timeout_seconds, 3.0)
 
     try:
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(config.webhook_url, json=payload)
-            if resp.status_code >= 400:
-                logger.warning(
-                    "Failed to send drift notification to webhook (%s): HTTP %s",
-                    safe_url,
-                    resp.status_code,
-                )
-                return False
-            logger.info("Successfully sent drift alert for model '%s' to webhook", model_name)
-            return True
+        transport = SSRFSafeTransport(
+            allowed_hosts=config.allowed_webhook_hosts,
+            allow_internal=config.allow_internal_webhooks,
+        )
+        with httpx.Client(transport=transport, timeout=timeout, follow_redirects=False) as client:
+            current_url = config.webhook_url
+            for redirect_step in range(4):  # Up to 3 redirects allowed
+                resp = client.post(current_url, json=payload)
+                if resp.is_redirect:
+                    location = resp.headers.get("Location")
+                    if not location:
+                        logger.warning("Redirect received from %s with no Location header", safe_url)
+                        return False
+                    next_url = urljoin(current_url, location)
+                    redir_safe, redir_err = is_safe_webhook_url(
+                        next_url,
+                        allowed_hosts=config.allowed_webhook_hosts,
+                        allow_internal=config.allow_internal_webhooks,
+                    )
+                    if not redir_safe:
+                        logger.warning(
+                            "Blocked unsafe redirect from %s to %s: %s",
+                            safe_url,
+                            sanitize_url_for_logging(next_url),
+                            redir_err,
+                        )
+                        return False
+                    current_url = next_url
+                    continue
+
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "Failed to send drift notification to webhook (%s): HTTP %s",
+                        safe_url,
+                        resp.status_code,
+                    )
+                    return False
+
+                logger.info("Successfully sent drift alert for model '%s' to webhook", model_name)
+                return True
+
+            logger.warning("Too many redirects attempted when posting to webhook %s", safe_url)
+            return False
     except Exception as exc:
         logger.warning(
             "Failed to send drift notification to webhook (%s): %s",

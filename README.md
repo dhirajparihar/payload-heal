@@ -9,7 +9,7 @@
 [![Pydantic v2](https://img.shields.io/badge/pydantic-v2-e92063.svg)](https://docs.pydantic.dev/)
 [![CI](https://github.com/dhirajparihar/payload-heal/actions/workflows/ci.yml/badge.svg)](https://github.com/dhirajparihar/payload-heal/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-67%20passed-brightgreen.svg)](https://github.com/dhirajparihar/payload-heal/actions)
+[![Tests](https://img.shields.io/badge/tests-76%20passed-brightgreen.svg)](https://github.com/dhirajparihar/payload-heal/actions)
 
 *Resilient Pydantic v2 model recovery from renamed keys, casing drift, and nested wrapper mutations.*
 
@@ -276,7 +276,7 @@ Run unit and integration tests across all modules:
 ```bash
 pytest -v
 ```
-All **67 tests** pass with coverage across heuristics, recursive PII redaction, AI healing, lockfile concurrency, SSRF protection, and end-to-end drift scenarios.
+All **76 tests** pass with coverage across Kuhn-Munkres maximum-weight bipartite matching, Pydantic field constraint verification (`gt=0`, `pattern`), adversarial recursive PII redaction, AI healing, lockfile concurrency & backup rotation, SSRF / DNS rebinding defenses, and end-to-end drift scenarios.
 
 ---
 
