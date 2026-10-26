@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
-from payload_heal.lockfile import DEFAULT_LOCKFILE_PATH, LockFileManager
+from payload_heal.lockfile import DEFAULT_LOCKFILE_PATH, LockFileManager, _resolve_model_key
 from payload_heal.skeleton import extract_json_skeleton
 
 
@@ -122,6 +122,54 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_explain(args: argparse.Namespace) -> int:
+    """Pretty-prints an in-depth audit trail, confidence score, and evidence report for healed mappings."""
+    lockfile_path = Path(args.lockfile)
+    mgr = LockFileManager(lockfile_path)
+    raw = mgr._read_raw()
+    models = raw.get("models", {})
+
+    target_model = args.model
+    if target_model:
+        resolved_key = _resolve_model_key(models, target_model)
+        if not resolved_key or resolved_key not in models:
+            print(f"Model '{target_model}' was not found in lockfile ({lockfile_path}).")
+            return 1
+        models = {resolved_key: models[resolved_key]}
+
+    if not models:
+        print(f"No healed mappings found in lockfile ({lockfile_path}).")
+        return 0
+
+    print("=" * 85)
+    print(f"PAYLOAD-HEAL AUDIT & EXPLAINABILITY REPORT: {lockfile_path}")
+    print("=" * 85)
+
+    for model_name, fields in models.items():
+        print(f"\n[Model: {model_name}]")
+        print(f"{'Field':<20} {'Source Path':<30} {'Strategy':<12} {'Confidence':<12} {'Evidence'}")
+        print("-" * 85)
+
+        for field_name, info in fields.items():
+            if not isinstance(info, dict):
+                continue
+            source_path = str(info.get("source_path", "unknown"))
+            healed_by = str(info.get("healed_by", "unknown")).upper()
+            confidence = info.get("confidence")
+            conf_str = f"{confidence * 100:.1f}%" if confidence is not None else "100.0%"
+            reason = str(info.get("reason", "Deterministic mapping"))
+
+            if len(source_path) > 28:
+                source_path_display = source_path[:25] + "..."
+            else:
+                source_path_display = source_path
+
+            print(f"{field_name:<20} {source_path_display:<30} {healed_by:<12} {conf_str:<12} {reason}")
+
+    print("\n" + "=" * 85)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Builds the CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -139,6 +187,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # status command
     subparsers.add_parser("status", help="Show all healed models and field mappings.")
+
+    # explain command
+    explain_parser = subparsers.add_parser(
+        "explain",
+        help="Audit confidence, evidence, and reasons for healed mappings.",
+    )
+    explain_parser.add_argument("model", nargs="?", help="Optional model name to explain.")
 
     # reset command
     reset_parser = subparsers.add_parser("reset", help="Reset all mappings or a specific model.")
@@ -167,6 +222,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "status":
         return cmd_status(args)
+    if args.command == "explain":
+        return cmd_explain(args)
     if args.command == "reset":
         return cmd_reset(args)
     if args.command == "inspect":

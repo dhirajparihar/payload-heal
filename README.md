@@ -9,7 +9,7 @@
 [![Pydantic v2](https://img.shields.io/badge/pydantic-v2-e92063.svg)](https://docs.pydantic.dev/)
 [![CI](https://github.com/dhirajparihar/payload-heal/actions/workflows/ci.yml/badge.svg)](https://github.com/dhirajparihar/payload-heal/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-76%20passed-brightgreen.svg)](https://github.com/dhirajparihar/payload-heal/actions)
+[![Tests](https://img.shields.io/badge/tests-86%20passed-brightgreen.svg)](https://github.com/dhirajparihar/payload-heal/actions)
 
 *Resilient Pydantic v2 model recovery from renamed keys, casing drift, and nested wrapper mutations.*
 
@@ -27,6 +27,24 @@ Calling an LLM on every incoming payload is impractical: it adds hundreds of mil
 - **Near-zero overhead (<0.1ms)** when incoming payloads are healthy.
 - **Fast, deterministic heuristic auto-healing ($0 cost)** for common schema drifts (casing changes, nested leaf promotion, token overlap).
 - **One-time AI recovery**: when heuristics cannot resolve an ambiguous drift, queries an LLM once on a lightweight, PII-sanitized skeleton, persists the verified mapping into a local lockfile cache, and **subsequently serves it from cache**.
+
+---
+
+## 📊 Performance & Latency Benchmarks
+
+Tested on Python 3.13 over 1,000 iterations per scenario ([`benchmarks/benchmark_suite.py`](benchmarks/benchmark_suite.py)):
+
+| Ingestion Strategy | p50 Latency | p99 Latency | Drift Recovery | Cost / 10k req | Security / Privacy |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Standard Pydantic v2 (Normal)** | `0.002 ms` | `0.003 ms` | 100% | $0.00 | Native |
+| **Standard Pydantic v2 (Drifted)** | N/A | N/A | **0% (Crash)** | $0.00 | Crash (`ValidationError`) |
+| **`payload-heal`: Fast Path** | `0.005 ms` | `0.016 ms` | 100% | $0.00 | Native |
+| **`payload-heal`: Tier-1 Heuristic** | `34.4 ms` | `34.4 ms` | **100%** | **$0.00** | 100% Local ($0, No AI) |
+| **`payload-heal`: Tier-0 Cache Hit** | `2.7 ms` | `5.5 ms` | **100%** | **$0.00** | Local Lockfile Cache |
+| **`payload-heal`: Tier-2 AI Recovery** | `46.7 ms`* | `46.7 ms`* | **100%** | **$0.002** (once) | Masked PII + SSRF Guard |
+| **Naive LLM-per-request** | `1,200 ms` | `2,400 ms` | 92% | **$20.00** | Raw payloads exposed |
+
+*\*Tier-2 runs strictly once upon new drift, then caches to Tier-0 for all subsequent requests.*
 
 ---
 
@@ -253,13 +271,17 @@ Lockfile updated automatically. No immediate action required.
 
 ## 💻 Developer CLI
 
-Inspect skeletons and manage lockfiles from your terminal:
+Inspect skeletons, explain mapping confidence, and manage lockfiles from your terminal:
 
 ```bash
 # View all healed models and field mappings
 payload-heal status
 
-# Inspect a raw JSON file and view skeleton structure
+# Audit mapping confidence, evidence reasons, and last healed timestamps
+payload-heal explain
+payload-heal explain ProductModel
+
+# Inspect a raw JSON file and view skeleton structure with token reduction metrics
 payload-heal inspect scraper_dump.json
 
 # Reset cached mappings for a specific model (or all models)
@@ -276,7 +298,7 @@ Run unit and integration tests across all modules:
 ```bash
 pytest -v
 ```
-All **76 tests** pass with coverage across Kuhn-Munkres maximum-weight bipartite matching, Pydantic field constraint verification (`gt=0`, `pattern`), adversarial recursive PII redaction, AI healing, lockfile concurrency & backup rotation, SSRF / DNS rebinding defenses, and end-to-end drift scenarios.
+All **86 tests** pass with coverage across Kuhn-Munkres maximum-weight bipartite matching, isolated single-field candidate validation (preventing `@model_validator` regressions), live HTTP socket transport and redirects, multi-process lockfile concurrency, adversarial recursive PII redaction, AI endpoint SSRF defenses, and end-to-end drift scenarios.
 
 ---
 

@@ -246,6 +246,8 @@ class LockFileManager:
         field_name: str,
         source_path: str,
         healed_by: str,
+        confidence: float | None = None,
+        reason: str | None = None,
     ) -> None:
         """Thread-safe and atomic persistence of a healed field path mapping.
 
@@ -254,6 +256,8 @@ class LockFileManager:
             field_name: Target attribute field on the model.
             source_path: Traversal path in the upstream payload (e.g. `items[0].price`).
             healed_by: Strategy used to heal (`heuristic` or `ai`).
+            confidence: Optional confidence score between 0.0 and 1.0.
+            reason: Optional human-readable match explanation / evidence.
         """
         with self._thread_lock:
             with self._acquire_file_lock():
@@ -264,12 +268,17 @@ class LockFileManager:
                 model_dict = models.setdefault(resolved_key, {})
 
                 now_iso = datetime.now(timezone.utc).isoformat()
-                model_dict[field_name] = {
+                entry: dict[str, Any] = {
                     "source_path": source_path,
                     "healed_by": healed_by,
                     "updated_at": now_iso,
                 }
+                if confidence is not None:
+                    entry["confidence"] = round(float(confidence), 4)
+                if reason:
+                    entry["reason"] = str(reason)
 
+                model_dict[field_name] = entry
                 self._write_raw(data)
 
     def invalidate_field(self, model_name: str, field_name: str) -> bool:
@@ -348,13 +357,19 @@ def save_mapping(
     field_name: str,
     source_path: str,
     healed_by: str,
+    confidence: float | None = None,
+    reason: str | None = None,
     lockfile_path: str | Path | None = None,
 ) -> None:
     """Module-level atomic persistence for a healed field mapping."""
     if lockfile_path is not None:
-        LockFileManager(lockfile_path).save_mapping(model_name, field_name, source_path, healed_by)
+        LockFileManager(lockfile_path).save_mapping(
+            model_name, field_name, source_path, healed_by, confidence, reason
+        )
     else:
-        _default_manager.save_mapping(model_name, field_name, source_path, healed_by)
+        _default_manager.save_mapping(
+            model_name, field_name, source_path, healed_by, confidence, reason
+        )
 
 
 def invalidate_field(

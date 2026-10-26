@@ -19,7 +19,11 @@ from pydantic.fields import FieldInfo
 
 from payload_heal.ai_healer import heal_with_llm
 from payload_heal.config import HealConfig
-from payload_heal.heuristics import find_heuristic_matches, is_type_compatible
+from payload_heal.heuristics import (
+    find_heuristic_matches,
+    is_type_compatible,
+    score_field_candidate,
+)
 from payload_heal.lockfile import LockFileManager
 from payload_heal.notifier import send_drift_notification
 from payload_heal.skeleton import extract_json_skeleton, get_by_dot_path
@@ -329,11 +333,18 @@ def _auto_heal_dict_impl(
 
                 if valid:
                     _apply_healed_field(field_name, field_info, validated_val)
+                    match_score = score_field_candidate(field_name, source_path)
+                    if aliases and field_name in aliases:
+                        alias_score = score_field_candidate(aliases[field_name], source_path)
+                        match_score = max(match_score, alias_score)
+                    reason = f"Bipartite heuristic similarity match (score: {match_score:.2f})"
                     lock_manager.save_mapping(
                         model_name,
                         field_name,
                         source_path,
                         healed_by="heuristic",
+                        confidence=match_score,
+                        reason=reason,
                     )
                     healed_notifications[field_name] = (source_path, "heuristic")
                 else:
@@ -391,6 +402,8 @@ def _auto_heal_dict_impl(
                         field_name,
                         source_path,
                         healed_by="ai",
+                        confidence=0.95,
+                        reason="LLM semantic schema recovery",
                     )
                     healed_notifications[field_name] = (source_path, "ai")
                 else:

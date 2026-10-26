@@ -59,3 +59,49 @@ def test_cli_inspect(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     assert "PAYLOAD-HEAL SKELETON INSPECTION" in captured
     assert "reduction" in captured
     assert "items[0].name" in captured
+
+
+def test_cli_explain(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    lockfile = tmp_path / ".payload_heal_lock.json"
+    mgr = LockFileManager(lockfile)
+    mgr.save_mapping(
+        "Product",
+        "price",
+        "data.item.priceUsd",
+        "heuristic",
+        confidence=0.96,
+        reason="Bipartite matching score 0.96",
+    )
+    mgr.save_mapping(
+        "Product",
+        "title",
+        "data.item.productName",
+        "ai",
+        confidence=0.95,
+        reason="LLM semantic schema recovery",
+    )
+
+    # 1. Explain all models
+    code = main(["--lockfile", str(lockfile), "explain"])
+    assert code == 0
+    captured = capsys.readouterr().out
+    assert "PAYLOAD-HEAL AUDIT & EXPLAINABILITY REPORT" in captured
+    assert "Product" in captured
+    assert "data.item.priceUsd" in captured
+    assert "96.0%" in captured
+    assert "Bipartite matching score 0.96" in captured
+    assert "HEURISTIC" in captured
+    assert "AI" in captured
+
+    # 2. Explain specific model
+    code_single = main(["--lockfile", str(lockfile), "explain", "Product"])
+    assert code_single == 0
+    captured_single = capsys.readouterr().out
+    assert "Product" in captured_single
+    assert "data.item.productName" in captured_single
+
+    # 3. Explain non-existent model
+    code_nonexistent = main(["--lockfile", str(lockfile), "explain", "NonExistentModel"])
+    assert code_nonexistent == 1
+    captured_err = capsys.readouterr().out
+    assert "Model 'NonExistentModel' was not found" in captured_err
