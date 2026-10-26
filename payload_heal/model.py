@@ -56,6 +56,32 @@ def get_model_identifier(schema: type[BaseModel] | str, config: HealConfig | Non
     return name
 
 
+_FIELD_SCHEMA_VALIDATOR_CACHE: dict[tuple[type[BaseModel], str], Any] = {}
+
+
+def _extract_field_core_schema(schema: Any, target_name: str) -> dict[str, Any] | None:
+    """Traverses a Pydantic core schema dictionary to extract the specific field's core schema."""
+    if not isinstance(schema, dict):
+        return None
+    if schema.get("type") == "model-fields" and "fields" in schema:
+        fields = schema["fields"]
+        if isinstance(fields, dict) and target_name in fields:
+            field_def = fields[target_name]
+            if isinstance(field_def, dict) and "schema" in field_def:
+                return field_def["schema"]
+    for val in schema.values():
+        if isinstance(val, dict):
+            res = _extract_field_core_schema(val, target_name)
+            if res is not None:
+                return res
+        elif isinstance(val, list):
+            for item in val:
+                res = _extract_field_core_schema(item, target_name)
+                if res is not None:
+                    return res
+    return None
+
+
 def validate_field_candidate(
     field_info: FieldInfo,
     field_name: str,
@@ -68,14 +94,46 @@ def validate_field_candidate(
     - Base type coercion (e.g., numeric string "49.99" -> float 49.99)
     - Numeric constraints: gt, ge, lt, le, multiple_of
     - String constraints: min_length, max_length, pattern regexes
-    - Custom @field_validator and @model_validator methods on model_cls
+    - Custom @field_validator methods on model_cls
     - Literal, Enum, Union, and nested model schemas
     - Field aliases with populate_by_name compatibility
+    - Preserves normal model semantics: does NOT prematurely trigger whole-model
+      @model_validator(mode="after") on incomplete instances with missing sibling fields.
 
     Returns:
         (is_valid, validated_coerced_value)
     """
-    # 1. Native compiled validation using model_cls.__pydantic_validator__
+    # 1. Native compiled single-field validation using pydantic_core.SchemaValidator
+    # This isolates candidate validation strictly to the field itself:
+    # - Enforces field type coercion and constraints (gt, min_length, regex, etc.)
+    # - Enforces model-level @field_validator(field_name) methods
+    # - Validates nested BaseModel, Union, and Enum schemas
+    # - Critically, avoids triggering whole-model @model_validator(mode="after") which checks
+    #   cross-field rules on incomplete instances where sibling fields are not yet healed.
+    if model_cls is not None and hasattr(model_cls, "__pydantic_core_schema__"):
+        cache_key = (model_cls, field_name)
+        validator = _FIELD_SCHEMA_VALIDATOR_CACHE.get(cache_key)
+        if validator is None:
+            try:
+                from pydantic_core import SchemaValidator
+
+                field_core_schema = _extract_field_core_schema(
+                    model_cls.__pydantic_core_schema__, field_name
+                )
+                if field_core_schema is not None:
+                    validator = SchemaValidator(field_core_schema)
+                    _FIELD_SCHEMA_VALIDATOR_CACHE[cache_key] = validator
+            except Exception:
+                validator = None
+
+        if validator is not None:
+            try:
+                coerced = validator.validate_python(value)
+                return True, coerced
+            except Exception:
+                return False, None
+
+    # 2. Native compiled assignment fallback (for models where core_schema extraction didn't find the field)
     if model_cls is not None and hasattr(model_cls, "__pydantic_validator__"):
         try:
             dummy_instance = model_cls.model_construct()
@@ -84,9 +142,9 @@ def validate_field_candidate(
             )
             return True, getattr(validated_instance, field_name)
         except Exception:
-            return False, None
+            pass
 
-    # 2. Dynamic single-field fallback validator
+    # 3. Dynamic single-field fallback validator
     try:
         from pydantic import ConfigDict, create_model
 

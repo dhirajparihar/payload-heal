@@ -12,7 +12,11 @@
 
 from __future__ import annotations
 
+import http.server
 import json
+import multiprocessing as mp
+import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -20,7 +24,7 @@ from typing import ClassVar, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from payload_heal.config import HealConfig
 from payload_heal.heuristics import find_heuristic_matches, solve_max_weight_bipartite_matching
@@ -696,4 +700,255 @@ def test_bipartite_matching_large_scale_scalability_benchmark():
     assert len(matches) > 0
     # Should complete comfortably under 250ms (typically ~100-140ms in pure Python)
     assert duration_ms < 250.0, f"Bipartite matching took {duration_ms:.2f}ms (expected < 250ms)"
+
+
+# ==============================================================================
+# 22. Model-Level @model_validator(mode="after") Cross-Field Rules During Healing
+# ==============================================================================
+
+def test_model_validator_after_cross_field_rules_during_healing(tmp_path: Path):
+    """Verifies that models with @model_validator(mode="after") and cross-field
+    dependent validation rules heal properly without candidates being prematurely rejected.
+    """
+    class Order(HealableModel):
+        item_id: str
+        quantity: int = Field(gt=0)
+        unit_price: float = Field(gt=0.0)
+
+        @field_validator("quantity")
+        @classmethod
+        def check_max_qty(cls, v: int) -> int:
+            if v > 100:
+                raise ValueError("Quantity cannot exceed 100")
+            return v
+
+        @model_validator(mode="after")
+        def validate_cross_fields(self) -> Order:
+            # Requires all fields to be present on self
+            if not hasattr(self, "item_id") or not hasattr(self, "quantity") or not hasattr(self, "unit_price"):
+                raise ValueError("Incomplete order: all fields required for after validation")
+            # Cross-field rule: total value cannot exceed 10,000
+            if self.quantity * self.unit_price > 10000:
+                raise ValueError("Total order value exceeds threshold")
+            return self
+
+    lockfile = tmp_path / "lock.json"
+    cfg = HealConfig(lockfile_path=lockfile, enable_heuristics=True, enable_ai=False)
+    Order.heal_config = cfg
+
+    # 1. Drifted payload where fields are renamed
+    drifted_payload = {
+        "itemId": "ITEM-XYZ",
+        "item_quantity": 10,
+        "price_per_unit": 25.50,
+    }
+
+    order = Order.model_validate(drifted_payload)
+    assert order.item_id == "ITEM-XYZ"
+    assert order.quantity == 10
+    assert order.unit_price == 25.50
+
+    # 2. Drifted payload where candidate violates field validator (quantity = 150 > 100)
+    drifted_invalid_field = {
+        "itemId": "ITEM-XYZ",
+        "item_quantity": 150,
+        "price_per_unit": 25.50,
+    }
+    with pytest.raises(Exception):
+        Order.model_validate(drifted_invalid_field)
+
+    # 3. Drifted payload where individual fields are valid, but cross-field rule fails:
+    # quantity = 50, price = 500 -> total = 25,000 > 10,000
+    drifted_invalid_cross = {
+        "itemId": "ITEM-XYZ",
+        "item_quantity": 50,
+        "price_per_unit": 500.0,
+    }
+    with pytest.raises(Exception):
+        Order.model_validate(drifted_invalid_cross)
+
+
+# ==============================================================================
+# 23. Live Local HTTP Server Integration Tests for SSRFSafeTransport & Webhooks
+# ==============================================================================
+
+def test_live_http_server_webhook_integration_and_redirects():
+    """Starts a live local HTTP server to verify SSRFSafeTransport network behavior,
+    redirect following, private IP blocking, and payload delivery.
+    """
+    received_requests: list[dict[str, Any]] = []
+
+    class MockWebhookHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else ""
+
+            if self.path == "/webhook":
+                received_requests.append({"path": "/webhook", "body": body})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status": "ok"}')
+
+            elif self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/final_webhook")
+                self.end_headers()
+
+            elif self.path == "/final_webhook":
+                received_requests.append({"path": "/final_webhook", "body": body})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status": "redirected_ok"}')
+
+            elif self.path == "/redirect_evil":
+                self.send_response(302)
+                self.send_header("Location", "http://10.0.0.1/evil")
+                self.end_headers()
+
+            elif self.path == "/redirect_loop":
+                self.send_response(302)
+                self.send_header("Location", "/redirect_loop")
+                self.end_headers()
+
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockWebhookHandler)
+    port = server.server_address[1]
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    try:
+        # 1. Allowed internal dispatch delivers payload to local server
+        cfg_allowed = HealConfig(
+            webhook_url=f"http://127.0.0.1:{port}/webhook",
+            allow_internal_webhooks=True,
+        )
+        drift_data = {"price": ("data.cost", "heuristic")}
+        success = send_drift_notification("TestProduct", drift_data, cfg_allowed)
+        assert success is True
+        assert len(received_requests) == 1
+        assert received_requests[0]["path"] == "/webhook"
+
+        # 2. Blocked internal dispatch when allow_internal_webhooks=False
+        cfg_blocked = HealConfig(
+            webhook_url=f"http://127.0.0.1:{port}/webhook",
+            allow_internal_webhooks=False,
+        )
+        blocked_success = send_drift_notification("TestProduct", drift_data, cfg_blocked)
+        assert blocked_success is False
+        assert len(received_requests) == 1  # No additional request received
+
+        # 3. Successful redirect follow
+        cfg_redir = HealConfig(
+            webhook_url=f"http://127.0.0.1:{port}/redirect",
+            allow_internal_webhooks=True,
+        )
+        redir_success = send_drift_notification("TestProduct", drift_data, cfg_redir)
+        assert redir_success is True
+        assert any(r["path"] == "/final_webhook" for r in received_requests)
+
+        # 4. Dangerous redirect destination blocked (even if initial host allowed)
+        cfg_evil = HealConfig(
+            webhook_url=f"http://127.0.0.1:{port}/redirect_evil",
+            allow_internal_webhooks=False,
+        )
+        evil_success = send_drift_notification("TestProduct", drift_data, cfg_evil)
+        assert evil_success is False
+
+        # 5. Redirect loop terminated safely
+        cfg_loop = HealConfig(
+            webhook_url=f"http://127.0.0.1:{port}/redirect_loop",
+            allow_internal_webhooks=True,
+        )
+        loop_success = send_drift_notification("TestProduct", drift_data, cfg_loop)
+        assert loop_success is False
+
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ==============================================================================
+# 24. Cross-Process Multiprocessing Concurrency Test
+# ==============================================================================
+
+def test_multiprocessing_lockfile_cross_process_safety(tmp_path: Path):
+    """Verifies that multiple independent OS processes concurrently writing,
+    reading, and invalidating the lockfile preserve all updates without data corruption.
+    """
+    from payload_heal.lockfile import _mp_worker_sync_test
+
+    lock_file = tmp_path / "cross_process_lock.json"
+    num_processes = 4
+    items_per_proc = 5
+
+    procs: list[mp.Process] = []
+    for p_id in range(num_processes):
+        p = mp.Process(
+            target=_mp_worker_sync_test,
+            args=(str(lock_file), p_id, items_per_proc),
+        )
+        procs.append(p)
+        p.start()
+
+    for p in procs:
+        p.join(timeout=15.0)
+        assert p.exitcode == 0, f"Worker process {p} exited with code {p.exitcode}"
+
+    # Verify the lockfile exists and contains all preserved entries
+    mgr = LockFileManager(lock_file)
+    data = mgr._read_raw()
+    models = data.get("models", {})
+    assert len(models) == num_processes
+
+    for p_id in range(num_processes):
+        model_name = f"ProcModel_{p_id}"
+        assert model_name in models
+        # field_0 was invalidated, so items_per_proc - 1 fields must remain
+        model_fields = models[model_name]
+        assert len(model_fields) == items_per_proc - 1
+        assert "field_0" not in model_fields
+        for i in range(1, items_per_proc):
+            assert f"field_{i}" in model_fields
+
+
+# ==============================================================================
+# 25. Connection-Time SSRF Protection for AI Endpoints
+# ==============================================================================
+
+def test_ai_endpoint_connection_time_ssrf_blocking():
+    """Verifies that an AI endpoint configured with a public hostname whose DNS
+    resolves to a private IP (e.g. cloud metadata or internal network) is blocked
+    at socket connection time by SSRFSafeTransport.
+    """
+    from payload_heal.ai_healer import heal_with_llm
+
+    cfg = HealConfig(
+        api_base="https://ai.external-domain.com/v1",
+        api_key="sk-test",
+    )
+
+    missing = {"summary": {"type": "str", "description": "text summary"}}
+    skeleton = {"data.text": {"type": "str", "sample": "hello world"}}
+
+    # Mock DNS resolution to return private cloud metadata IP (169.254.169.254)
+    fake_dns = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 443))
+    ]
+
+    with patch("socket.getaddrinfo", return_value=fake_dns):
+        matches = heal_with_llm("SummaryModel", missing, skeleton, cfg)
+        assert matches == {}
+
+    # Verify that intended local provider (e.g. Ollama on localhost) is allowed to connect locally
+    cfg_ollama = HealConfig(llm_provider="ollama")
+    assert cfg_ollama.api_base == "http://localhost:11434/v1"
+
 

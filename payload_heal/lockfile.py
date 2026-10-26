@@ -366,3 +366,18 @@ def invalidate_field(
     if lockfile_path is not None:
         return LockFileManager(lockfile_path).invalidate_field(model_name, field_name)
     return _default_manager.invalidate_field(model_name, field_name)
+
+
+def _mp_worker_sync_test(lockfile_path: str, proc_id: int, count: int = 5) -> None:
+    """Internal test helper for verifying inter-process synchronization across spawned OS processes."""
+    mgr = LockFileManager(lockfile_path)
+    model_name = f"ProcModel_{proc_id}"
+    for i in range(count):
+        field_name = f"field_{i}"
+        source_path = f"data.proc_{proc_id}.f_{i}"
+        mgr.save_mapping(model_name, field_name, source_path, "heuristic")
+        m = mgr.get_mapping(model_name)
+        assert field_name in m
+    # Invalidate one field to test concurrent invalidations across processes
+    mgr.invalidate_field(model_name, "field_0")
+

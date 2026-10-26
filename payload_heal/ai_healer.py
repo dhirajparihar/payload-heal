@@ -168,7 +168,19 @@ def heal_with_llm(
     }
 
     try:
-        with httpx.Client(timeout=config.timeout_seconds) as client:
+        from urllib.parse import urlsplit
+        from payload_heal.notifier import SSRFSafeTransport
+
+        parsed = urlsplit(config.api_base)
+        host = (parsed.hostname or "").lower()
+        is_local = host in ("localhost", "127.0.0.1", "::1")
+        allow_internal = config.allow_insecure_ai_endpoints or is_local
+
+        transport = SSRFSafeTransport(
+            allowed_hosts=config.allowed_ai_hosts,
+            allow_internal=allow_internal,
+        )
+        with httpx.Client(transport=transport, timeout=config.timeout_seconds) as client:
             response = client.post(endpoint, headers=headers, json=payload)
             if response.status_code >= 400:
                 logger.warning(
