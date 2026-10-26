@@ -228,8 +228,20 @@ class SSRFSafeTransport(httpx.HTTPTransport):
         self.allowed_hosts = allowed_hosts
         self.allow_internal = allow_internal
         super().__init__(**kwargs)
+
+        # Resolve SSL context robustly across HTTPX/HTTPCore versions
+        ssl_ctx = getattr(self._pool, "_ssl_context", None)
+        if ssl_ctx is None:
+            verify = kwargs.get("verify", True)
+            cert = kwargs.get("cert")
+            trust_env = kwargs.get("trust_env", True)
+            try:
+                ssl_ctx = httpx.create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
+            except Exception:
+                ssl_ctx = None
+
         self._pool = httpcore.ConnectionPool(
-            ssl_context=self._pool._ssl_context,
+            ssl_context=ssl_ctx,
             network_backend=SSRFSafeBackend(
                 allowed_hosts=allowed_hosts,
                 allow_internal=allow_internal,

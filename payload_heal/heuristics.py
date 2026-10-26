@@ -420,6 +420,7 @@ def find_heuristic_matches(
     skeleton: dict[str, dict[str, Any]],
     confidence_threshold: float = 0.78,
     margin: float = 0.05,
+    aliases: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Finds deterministic heuristic matches for missing model fields.
 
@@ -429,6 +430,7 @@ def find_heuristic_matches(
         confidence_threshold: Minimum confidence score required to accept a match (default: 0.78).
         margin: Minimum score difference between best and second-best candidate required
                 to prevent ambiguous guesses (default: 0.05).
+        aliases: Optional mapping of `field_name -> alias_string` to check alongside field_name.
 
     Returns:
         Mapping of `field_name -> healed_source_path`.
@@ -450,8 +452,12 @@ def find_heuristic_matches(
             if not is_type_compatible(expected_type, actual_type, sample_val):
                 continue
 
-            # 2. Compute similarity score
+            # 2. Compute similarity score (considering both field_name and alias)
             score = score_field_candidate(field_name, path)
+            if aliases and field_name in aliases:
+                alias_score = score_field_candidate(aliases[field_name], path)
+                score = max(score, alias_score)
+
             if score >= confidence_threshold:
                 candidates.append((score, path))
 

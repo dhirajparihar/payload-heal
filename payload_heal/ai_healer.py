@@ -133,6 +133,21 @@ def heal_with_llm(
     if not missing_fields or not skeleton:
         return {}
 
+    from payload_heal.config import validate_ai_endpoint
+    try:
+        validate_ai_endpoint(
+            config.api_base,
+            config.allowed_ai_hosts,
+            config.allow_insecure_ai_endpoints,
+        )
+    except Exception as exc:
+        logger.warning(
+            "AI Healer rejected untrusted endpoint '%s': %s",
+            config.api_base,
+            exc,
+        )
+        return {}
+
     endpoint = f"{config.api_base.rstrip('/')}/chat/completions"
 
     headers: dict[str, str] = {

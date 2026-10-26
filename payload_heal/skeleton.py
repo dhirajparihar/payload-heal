@@ -260,12 +260,12 @@ def extract_json_skeleton(
 
     def _recurse(curr: Any, curr_path: str) -> None:
         if isinstance(curr, dict):
+            if curr_path:
+                skeleton[curr_path] = {
+                    "type": "dict",
+                    "sample": format_sample_preview(curr, max_len=60) if curr else "{}",
+                }
             if not curr:
-                if curr_path:
-                    skeleton[curr_path] = {
-                        "type": "dict",
-                        "sample": "{}",
-                    }
                 return
             for key, val in curr.items():
                 key_str = str(key)

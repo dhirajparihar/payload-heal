@@ -79,29 +79,11 @@ class HealConfig:
             )
 
         # Validate AI endpoint security & trust boundary
-        if self.api_base:
-            from urllib.parse import urlsplit
-            parsed_base = urlsplit(self.api_base)
-            scheme = (parsed_base.scheme or "").lower()
-            if scheme not in ("http", "https"):
-                raise ValueError(f"Invalid AI api_base scheme '{scheme}': must be http or https")
-
-            host = (parsed_base.hostname or "").lower()
-            # Non-local endpoints must use HTTPS unless allow_insecure_ai_endpoints is explicitly True
-            if scheme == "http" and host not in ("localhost", "127.0.0.1", "::1") and not self.allow_insecure_ai_endpoints:
-                raise ValueError(
-                    f"Insecure HTTP AI endpoint '{self.api_base}' is disallowed for non-local hosts. "
-                    "Use HTTPS or set allow_insecure_ai_endpoints=True if explicitly required."
-                )
-
-            # Check AI host allowlist if configured
-            if self.allowed_ai_hosts:
-                matched = any(
-                    host == h.lower() or host.endswith(f".{h.lower()}")
-                    for h in self.allowed_ai_hosts
-                )
-                if not matched:
-                    raise ValueError(f"AI endpoint host '{host}' is not in configured allowed_ai_hosts")
+        validate_ai_endpoint(
+            self.api_base,
+            self.allowed_ai_hosts,
+            self.allow_insecure_ai_endpoints,
+        )
 
         # Resolve API key from environment if not explicitly set
         if not self.api_key:
@@ -125,3 +107,37 @@ class HealConfig:
         if provider == "ollama":
             return os.getenv("OLLAMA_API_KEY") or "ollama"
         return None
+
+
+def validate_ai_endpoint(
+    api_base: str | None,
+    allowed_ai_hosts: list[str] | None = None,
+    allow_insecure_ai_endpoints: bool = False,
+) -> None:
+    """Validates the AI api_base endpoint against URL scheme and host restrictions."""
+    if not api_base:
+        return
+
+    from urllib.parse import urlsplit
+
+    parsed_base = urlsplit(api_base)
+    scheme = (parsed_base.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Invalid AI api_base scheme '{scheme}': must be http or https")
+
+    host = (parsed_base.hostname or "").lower()
+    # Non-local endpoints must use HTTPS unless allow_insecure_ai_endpoints is explicitly True
+    if scheme == "http" and host not in ("localhost", "127.0.0.1", "::1") and not allow_insecure_ai_endpoints:
+        raise ValueError(
+            f"Insecure HTTP AI endpoint '{api_base}' is disallowed for non-local hosts. "
+            "Use HTTPS or set allow_insecure_ai_endpoints=True if explicitly required."
+        )
+
+    # Check AI host allowlist if configured
+    if allowed_ai_hosts:
+        matched = any(
+            host == h.lower() or host.endswith(f".{h.lower()}")
+            for h in allowed_ai_hosts
+        )
+        if not matched:
+            raise ValueError(f"AI endpoint host '{host}' is not in configured allowed_ai_hosts")

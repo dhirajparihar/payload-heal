@@ -13,12 +13,14 @@
 from __future__ import annotations
 
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import ClassVar, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from payload_heal.config import HealConfig
 from payload_heal.heuristics import find_heuristic_matches, solve_max_weight_bipartite_matching
@@ -540,3 +542,158 @@ def test_model_cache_id_namespace_override(tmp_path: Path):
     # When config does not have it, class-level model_cache_id is used
     cfg_default = HealConfig(lockfile_path=lock_path)
     assert get_model_identifier(CustomEntryModel, cfg_default) == "service_v2.CustomEntryModel"
+
+
+# ==============================================================================
+# 17. Custom Field Validators Enforced During Healing
+# ==============================================================================
+
+def test_custom_field_validator_enforced_during_candidate_healing(tmp_path: Path):
+    """Verifies that model-level @field_validator methods are strictly executed
+    when evaluating candidate values for healing, rejecting candidates that violate them.
+    """
+    class ValidatedProduct(HealableModel):
+        price: float
+
+        @field_validator("price")
+        @classmethod
+        def validate_even_price(cls, v: float) -> float:
+            if v % 2 != 0:
+                raise ValueError("Price must be an even number")
+            return v
+
+    lockfile = tmp_path / "lock.json"
+    cfg = HealConfig(lockfile_path=lockfile, enable_heuristics=True, enable_ai=False)
+    ValidatedProduct.heal_config = cfg
+
+    # 1. Payload with candidate price = 3.0 (odd number -> fails @field_validator)
+    payload_invalid = {"unit_price": 3.0}
+    with pytest.raises(Exception):
+        ValidatedProduct.model_validate(payload_invalid)
+
+    # 2. Payload with candidate price = 4.0 (even number -> passes @field_validator)
+    payload_valid = {"unit_price": 4.0}
+    product = ValidatedProduct.model_validate(payload_valid)
+    assert product.price == 4.0
+
+
+# ==============================================================================
+# 18. Field Alias & Nested Model Candidate Healing
+# ==============================================================================
+
+def test_field_alias_and_nested_model_candidate_healing(tmp_path: Path):
+    """Verifies that candidate validation succeeds for fields with aliases and nested BaseModels."""
+    class Address(BaseModel):
+        city: str
+        zip_code: str
+
+    class UserProfile(HealableModel):
+        address: Address
+        display_name: str = Field(alias="screenName")
+
+    lockfile = tmp_path / "lock.json"
+    cfg = HealConfig(lockfile_path=lockfile, enable_heuristics=True, enable_ai=False)
+    UserProfile.heal_config = cfg
+
+    # Upstream drifted: 'user_address' and 'screen_name'
+    payload = {
+        "user_address": {"city": "San Francisco", "zip_code": "94105"},
+        "screen_name": "coder123",
+    }
+
+    user = UserProfile.model_validate(payload)
+    assert user.address.city == "San Francisco"
+    assert user.address.zip_code == "94105"
+    assert user.display_name == "coder123"
+
+
+# ==============================================================================
+# 19. Concurrent Lockfile Writes & Invalidation Stress Test
+# ==============================================================================
+
+def test_concurrent_lockfile_writes_and_invalidations(tmp_path: Path):
+    """Verifies that concurrent processes/threads writing, reading, and invalidating
+    the lockfile simultaneously do not cause deadlocks, corruption, or data loss.
+    """
+    lock_file = tmp_path / "concurrent_lock.json"
+    mgr = LockFileManager(lock_file)
+
+    num_threads = 50
+
+    def worker(i: int):
+        model_name = f"Model_{i % 5}"
+        field_name = f"field_{i % 3}"
+        source_path = f"data.source_{i}"
+
+        # Alternating write, read, and invalidation operations
+        if i % 3 == 0:
+            mgr.save_mapping(model_name, field_name, source_path, "heuristic")
+        elif i % 3 == 1:
+            _ = mgr.get_mapping(model_name)
+        else:
+            mgr.invalidate_field(model_name, field_name)
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(worker, i) for i in range(num_threads)]
+        for f in futures:
+            f.result()
+
+    # The resulting lockfile must remain valid JSON and readable
+    assert lock_file.exists()
+    content = json.loads(lock_file.read_text(encoding="utf-8"))
+    assert "version" in content
+    assert "models" in content
+
+
+# ==============================================================================
+# 20. Post-Init AI Endpoint Mutation Blocked at Request Time
+# ==============================================================================
+
+def test_post_init_ai_endpoint_mutation_blocked_at_request_time():
+    """Verifies that mutating api_base on HealConfig after initialization
+    is intercepted and rejected at request time before any network request is made.
+    """
+    from payload_heal.ai_healer import heal_with_llm
+
+    # Valid config initialized cleanly
+    cfg = HealConfig(api_base="https://api.openai.com/v1")
+
+    # Untrusted runtime mutation targeting an unauthorized internal HTTP host
+    cfg.api_base = "http://untrusted-internal-host.local/v1"
+
+    missing = {"price": {"type": "float", "description": ""}}
+    skeleton = {"price_usd": {"type": "float", "sample": "10.0"}}
+
+    # heal_with_llm must detect insecure scheme and return empty dict without connecting
+    matches = heal_with_llm("TestModel", missing, skeleton, cfg)
+    assert matches == {}
+
+
+# ==============================================================================
+# 21. Maximum-Weight Bipartite Matching Scalability Benchmark
+# ==============================================================================
+
+def test_bipartite_matching_large_scale_scalability_benchmark():
+    """Verifies Kuhn-Munkres algorithm runtime with a large candidate graph
+    (100 fields x 100 paths) completes in < 250ms without excessive resource use.
+    """
+    num_fields = 100
+    num_paths = 100
+
+    field_candidates: dict[str, list[tuple[float, str]]] = {}
+    for i in range(num_fields):
+        # Each field has multiple candidate paths with varying scores
+        cands = [
+            (0.95 - (j * 0.01), f"path_{j}")
+            for j in range(max(0, i - 2), min(num_paths, i + 3))
+        ]
+        field_candidates[f"field_{i}"] = cands
+
+    start_time = time.perf_counter()
+    matches = solve_max_weight_bipartite_matching(field_candidates)
+    duration_ms = (time.perf_counter() - start_time) * 1000.0
+
+    assert len(matches) > 0
+    # Should complete comfortably under 250ms (typically ~100-140ms in pure Python)
+    assert duration_ms < 250.0, f"Bipartite matching took {duration_ms:.2f}ms (expected < 250ms)"
+

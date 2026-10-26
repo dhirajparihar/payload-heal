@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import threading
 from typing import Any, Callable, ClassVar
 
 from pydantic import BaseModel, model_validator
@@ -24,6 +25,7 @@ from payload_heal.notifier import send_drift_notification
 from payload_heal.skeleton import extract_json_skeleton, get_by_dot_path
 
 logger = logging.getLogger("payload_heal.model")
+_HEALING_ACTIVE = threading.local()
 
 
 def get_model_identifier(schema: type[BaseModel] | str, config: HealConfig | None = None) -> str:
@@ -58,6 +60,7 @@ def validate_field_candidate(
     field_info: FieldInfo,
     field_name: str,
     value: Any,
+    model_cls: type[BaseModel] | None = None,
 ) -> tuple[bool, Any]:
     """Validates a candidate healed value against the field's actual Pydantic schema and constraints.
 
@@ -65,22 +68,36 @@ def validate_field_candidate(
     - Base type coercion (e.g., numeric string "49.99" -> float 49.99)
     - Numeric constraints: gt, ge, lt, le, multiple_of
     - String constraints: min_length, max_length, pattern regexes
+    - Custom @field_validator and @model_validator methods on model_cls
     - Literal, Enum, Union, and nested model schemas
+    - Field aliases with populate_by_name compatibility
 
     Returns:
         (is_valid, validated_coerced_value)
     """
-    try:
-        from pydantic import create_model, ValidationError
+    # 1. Native compiled validation using model_cls.__pydantic_validator__
+    if model_cls is not None and hasattr(model_cls, "__pydantic_validator__"):
+        try:
+            dummy_instance = model_cls.model_construct()
+            validated_instance = model_cls.__pydantic_validator__.validate_assignment(
+                dummy_instance, field_name, value
+            )
+            return True, getattr(validated_instance, field_name)
+        except Exception:
+            return False, None
 
-        # Construct a temporary single-field validation model
+    # 2. Dynamic single-field fallback validator
+    try:
+        from pydantic import ConfigDict, create_model
+
         validator_model = create_model(
             "_CandidateValidator",
+            __config__=ConfigDict(populate_by_name=True, arbitrary_types_allowed=True),
             **{field_name: (field_info.annotation, field_info)},
         )
         instance = validator_model(**{field_name: value})
         return True, getattr(instance, field_name)
-    except (ValidationError, Exception):
+    except Exception:
         return False, None
 
 
@@ -89,6 +106,8 @@ def get_field_type_str(field_info: FieldInfo) -> str:
     ann = field_info.annotation
     if ann is None:
         return "Any"
+    if isinstance(ann, type) and issubclass(ann, BaseModel):
+        return "dict"
     if hasattr(ann, "__name__"):
         return ann.__name__
     return str(ann).replace("typing.", "")
@@ -99,6 +118,7 @@ def auto_heal_dict(
     model_name: str,
     model_fields: dict[str, FieldInfo],
     config: HealConfig,
+    model_cls: type[BaseModel] | None = None,
 ) -> dict[str, Any]:
     """Applies the 3-tier healing pipeline to an incoming dictionary payload.
 
@@ -113,6 +133,29 @@ def auto_heal_dict(
     if not config.enabled:
         return data
 
+    if getattr(_HEALING_ACTIVE, "active", False):
+        return data
+
+    _HEALING_ACTIVE.active = True
+    try:
+        return _auto_heal_dict_impl(
+            data,
+            model_name,
+            model_fields,
+            config,
+            model_cls=model_cls,
+        )
+    finally:
+        _HEALING_ACTIVE.active = False
+
+
+def _auto_heal_dict_impl(
+    data: dict[str, Any],
+    model_name: str,
+    model_fields: dict[str, FieldInfo],
+    config: HealConfig,
+    model_cls: type[BaseModel] | None = None,
+) -> dict[str, Any]:
     def is_present(name: str, f: FieldInfo) -> bool:
         alias = getattr(f, "alias", None)
         return name in data or (bool(alias) and alias in data)
@@ -131,6 +174,12 @@ def auto_heal_dict(
     healed_notifications: dict[str, tuple[str, str]] = {}
     lock_manager = LockFileManager(config.lockfile_path)
 
+    def _apply_healed_field(f_name: str, f_info: FieldInfo, coerced_val: Any) -> None:
+        healed_data[f_name] = coerced_val
+        alias = getattr(f_info, "alias", None)
+        if alias and alias != f_name:
+            healed_data[str(alias)] = coerced_val
+
     # --------------------------------------------------------------------------
     # Step 1: Tier 0 Lockfile Lookup & Re-Drift Invalidation
     # --------------------------------------------------------------------------
@@ -146,10 +195,14 @@ def auto_heal_dict(
 
                 # Safety Check: Structural compatibility filter + full Pydantic constraint check
                 type_ok = is_type_compatible(expected_type, actual_type, val)
-                valid, validated_val = validate_field_candidate(field_info, field_name, val) if type_ok else (False, None)
+                valid, validated_val = (
+                    validate_field_candidate(field_info, field_name, val, model_cls=model_cls)
+                    if type_ok
+                    else (False, None)
+                )
 
                 if valid:
-                    healed_data[field_name] = validated_val
+                    _apply_healed_field(field_name, field_info, validated_val)
                 else:
                     logger.warning(
                         "Cached path '%s' for field '%s' with value %r failed Pydantic field validation. Invalidating cache.",
@@ -187,7 +240,16 @@ def auto_heal_dict(
         heuristic_input = {
             name: get_field_type_str(f) for name, f in remaining_missing.items()
         }
-        heuristic_matches = find_heuristic_matches(heuristic_input, skeleton)
+        aliases = {
+            name: str(f.alias)
+            for name, f in remaining_missing.items()
+            if getattr(f, "alias", None)
+        }
+        heuristic_matches = find_heuristic_matches(
+            heuristic_input,
+            skeleton,
+            aliases=aliases,
+        )
 
         for field_name, source_path in heuristic_matches.items():
             found, val = get_by_dot_path(data, source_path)
@@ -201,10 +263,14 @@ def auto_heal_dict(
 
                 # Safety Check: Structural filter + full Pydantic constraint check
                 type_ok = is_type_compatible(expected_type, actual_type, val)
-                valid, validated_val = validate_field_candidate(field_info, field_name, val) if type_ok else (False, None)
+                valid, validated_val = (
+                    validate_field_candidate(field_info, field_name, val, model_cls=model_cls)
+                    if type_ok
+                    else (False, None)
+                )
 
                 if valid:
-                    healed_data[field_name] = validated_val
+                    _apply_healed_field(field_name, field_info, validated_val)
                     lock_manager.save_mapping(
                         model_name,
                         field_name,
@@ -254,10 +320,14 @@ def auto_heal_dict(
 
                 # Safety Check: Structural filter + full Pydantic constraint check
                 type_ok = is_type_compatible(expected_type, actual_type, val)
-                valid, validated_val = validate_field_candidate(field_info, field_name, val) if type_ok else (False, None)
+                valid, validated_val = (
+                    validate_field_candidate(field_info, field_name, val, model_cls=model_cls)
+                    if type_ok
+                    else (False, None)
+                )
 
                 if valid:
-                    healed_data[field_name] = validated_val
+                    _apply_healed_field(field_name, field_info, validated_val)
                     lock_manager.save_mapping(
                         model_name,
                         field_name,
@@ -312,6 +382,7 @@ class HealableModel(BaseModel):
             model_name=get_model_identifier(cls, config),
             model_fields=cls.model_fields,
             config=config,
+            model_cls=cls,
         )
 
 
@@ -330,6 +401,7 @@ def heal_payload(
         model_name=get_model_identifier(schema, cfg),
         model_fields=schema.model_fields,
         config=cfg,
+        model_cls=schema if isinstance(schema, type) and issubclass(schema, BaseModel) else None,
     )
 
 
