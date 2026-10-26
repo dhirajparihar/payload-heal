@@ -174,7 +174,8 @@ def heal_with_llm(
         parsed = urlsplit(config.api_base)
         host = (parsed.hostname or "").lower()
         is_local = host in ("localhost", "127.0.0.1", "::1")
-        allow_internal = config.allow_insecure_ai_endpoints or is_local
+        # Decouple transport encryption (HTTP vs HTTPS) from destination network boundary (private IP / SSRF defense)
+        allow_internal = config.allow_internal_ai_endpoints or is_local
 
         transport = SSRFSafeTransport(
             allowed_hosts=config.allowed_ai_hosts,

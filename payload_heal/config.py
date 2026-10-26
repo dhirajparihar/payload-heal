@@ -53,6 +53,7 @@ class HealConfig:
     allow_internal_webhooks: bool = False
     allowed_ai_hosts: list[str] | None = None
     allow_insecure_ai_endpoints: bool = False
+    allow_internal_ai_endpoints: bool = False
     timeout_seconds: float = 8.0
 
     def clone(self) -> HealConfig:

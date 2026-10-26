@@ -952,3 +952,33 @@ def test_ai_endpoint_connection_time_ssrf_blocking():
     assert cfg_ollama.api_base == "http://localhost:11434/v1"
 
 
+def test_allow_insecure_ai_endpoints_does_not_disable_private_ip_protection():
+    """Verifies that setting allow_insecure_ai_endpoints=True (to permit plain HTTP)
+    does NOT automatically permit connecting to private/internal IPs.
+    Private IP access requires explicit allow_internal_ai_endpoints=True.
+    """
+    from payload_heal.ai_healer import heal_with_llm
+
+    # Plain HTTP enabled, but private IP access disabled
+    cfg = HealConfig(
+        api_base="http://plain-http-gateway.example.com/v1",
+        api_key="sk-test",
+        allow_insecure_ai_endpoints=True,
+        allow_internal_ai_endpoints=False,
+    )
+
+    missing = {"summary": {"type": "str", "description": "text summary"}}
+    skeleton = {"data.text": {"type": "str", "sample": "hello world"}}
+
+    # Target resolves to private internal IP 10.0.0.5
+    fake_dns = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 80))
+    ]
+
+    # Even with allow_insecure_ai_endpoints=True, socket connection to private IP must be blocked
+    with patch("socket.getaddrinfo", return_value=fake_dns):
+        matches = heal_with_llm("SummaryModel", missing, skeleton, cfg)
+        assert matches == {}
+
+
+
